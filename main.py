@@ -736,6 +736,19 @@ def get_companies():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/stats")
+def get_stats():
+    """Public stats endpoint for homepage counters."""
+    try:
+        return {
+            "freshers":  db.Freshers.count_documents({}),
+            "pwbd":      db.PwBDs.count_documents({}),
+            "companies": db.Requirements.count_documents({}),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/health")
 def health_check():
     """Simple health check endpoint for load balancer / uptime monitoring."""

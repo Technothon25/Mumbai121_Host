@@ -1,0 +1,13 @@
+# Mumbai121 — Python dependencies
+# Install with: pip install -r requirements.txt
+
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+gunicorn==22.0.0
+pymongo==4.8.0
+python-multipart==0.0.9
+python-dotenv==1.0.1
+werkzeug==3.1.0
+scikit-learn==1.8.0
+pymongo==4.8.0
+dnspython==2.6.1

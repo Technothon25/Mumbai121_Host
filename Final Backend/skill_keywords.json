@@ -1,0 +1,280 @@
+{
+  "IT Engineer": {
+    "software developer": [
+      "coding", "programming", "java", "python", "c++", "javascript", "software engineering",
+      "algorithms", "data structures", "object oriented", "oop", "development", "debugging",
+      "version control", "git", "software design", "agile", "scrum"
+    ],
+    "web developer": [
+      "html", "css", "javascript", "react", "angular", "vue", "node.js", "express",
+      "frontend", "backend", "fullstack", "web development", "responsive design",
+      "bootstrap", "jquery", "ajax", "web design", "ui", "ux"
+    ],
+    "backend": [
+      "api", "rest", "restful", "server", "database", "sql", "mysql", "postgresql",
+      "mongodb", "nosql", "node.js", "python", "java", "php", "microservices",
+      "server-side", "data modeling", "authentication", "authorization"
+    ],
+    "frontend": [
+      "html", "css", "javascript", "react", "angular", "vue", "typescript",
+      "sass", "less", "webpack", "responsive", "ui", "ux", "web design",
+      "bootstrap", "material ui", "tailwind", "redux", "state management"
+    ],
+    "fullstack": [
+      "frontend", "backend", "database", "full-stack", "mern", "mean", "web development",
+      "react", "node.js", "mongodb", "api", "rest", "html", "css", "javascript",
+      "sql", "deployment", "cloud"
+    ],
+    "database": [
+      "sql", "mysql", "postgresql", "mongodb", "nosql", "oracle", "database design",
+      "data modeling", "queries", "stored procedures", "backend", "server-side",
+      "database administration", "indexing", "optimization"
+    ],
+    "qa": [
+      "testing", "quality assurance", "test cases", "selenium", "automation",
+      "manual testing", "junit", "testng", "bug tracking", "jira", "regression testing",
+      "integration testing", "functional testing", "performance testing"
+    ],
+    "it support": [
+      "technical support", "troubleshooting", "help desk", "customer support",
+      "hardware", "software", "networking", "windows", "linux", "systems administration",
+      "ticketing", "problem solving", "user support"
+    ],
+    "network": [
+      "networking", "cisco", "tcp/ip", "lan", "wan", "vpn", "firewall",
+      "routing", "switching", "network security", "network administration",
+      "dns", "dhcp", "network infrastructure"
+    ],
+    "mobile": [
+      "android", "ios", "react native", "flutter", "mobile app", "app development",
+      "kotlin", "swift", "java", "mobile ui", "mobile development"
+    ],
+    "devops": [
+      "docker", "kubernetes", "ci/cd", "jenkins", "aws", "azure", "gcp",
+      "deployment", "cloud", "linux", "bash", "automation", "monitoring",
+      "terraform", "ansible", "continuous integration"
+    ],
+    "cloud": [
+      "aws", "azure", "gcp", "cloud computing", "ec2", "s3", "lambda",
+      "cloud architecture", "devops", "serverless", "cloud storage"
+    ]
+  },
+  
+  "Non-IT Engineer": {
+    "production": [
+      "manufacturing", "production planning", "process optimization", "lean manufacturing",
+      "quality control", "six sigma", "production line", "assembly", "operations",
+      "factory", "industrial", "process improvement", "manufacturing processes"
+    ],
+    "quality control": [
+      "quality assurance", "qc", "qa", "inspection", "testing", "iso",
+      "standards", "quality management", "defect analysis", "sampling",
+      "quality systems", "compliance", "audit", "spc", "statistical process control"
+    ],
+    "design": [
+      "autocad", "solidworks", "catia", "cad", "3d modeling", "mechanical design",
+      "product design", "drafting", "technical drawing", "engineering design",
+      "design engineering", "2d drawing", "3d design", "prototyping"
+    ],
+    "maintenance": [
+      "preventive maintenance", "equipment maintenance", "troubleshooting",
+      "repair", "machinery", "electrical", "mechanical", "industrial maintenance",
+      "maintenance planning", "breakdown maintenance", "tpm", "cmms"
+    ],
+    "site": [
+      "site engineer", "construction", "civil", "project management", "site supervision",
+      "on-site", "field work", "construction management", "site planning",
+      "building", "infrastructure", "civil engineering"
+    ],
+    "service": [
+      "field service", "customer service", "after-sales", "installation",
+      "commissioning", "technical service", "service engineer", "maintenance service",
+      "client support", "troubleshooting", "equipment service"
+    ],
+    "mechanical": [
+      "mechanical engineering", "machinery", "equipment", "maintenance",
+      "manufacturing", "production", "design", "cad", "solidworks"
+    ],
+    "electrical": [
+      "electrical engineering", "circuits", "plc", "automation", "control systems",
+      "electrical design", "wiring", "power systems", "instrumentation"
+    ],
+    "civil": [
+      "civil engineering", "construction", "structural", "building", "infrastructure",
+      "site work", "surveying", "concrete", "reinforcement"
+    ],
+    "automobile": [
+      "automotive", "vehicle", "engine", "automobile engineering", "mechanical",
+      "car", "manufacturing", "assembly", "vehicle maintenance"
+    ]
+  },
+  
+  "Sales And Marketing": {
+    "digital marketing": [
+      "seo", "sem", "social media", "content marketing", "email marketing", "content creation",
+      "google ads", "facebook ads", "online marketing", "digital campaigns",
+      "analytics", "google analytics", "ppc", "pay per click", "marketing automation"
+    ],
+    "sales": [
+      "sales executive", "business development", "client acquisition", "lead generation",
+      "cold calling", "negotiation", "closing", "b2b sales", "b2c sales",
+      "revenue generation", "sales targets", "customer relationship", "crm"
+    ],
+    "business development": [
+      "bd", "lead generation", "client acquisition", "sales", "partnerships",
+      "proposal", "pitching", "market research", "strategy", "growth",
+      "networking", "relationship building", "new business"
+    ],
+    "seo": [
+      "search engine optimization", "keyword research", "on-page seo", "off-page seo",
+      "link building", "google ranking", "organic traffic", "content optimization",
+      "seo tools", "analytics", "digital marketing"
+    ],
+    "social media": [
+      "facebook", "instagram", "twitter", "linkedin", "social media marketing",
+      "content creation", "engagement", "social media strategy", "posts",
+      "campaigns", "influencer marketing", "community management"
+    ],
+    "content": [
+      "content writing", "content creation", "copywriting", "blog writing",
+      "content marketing", "creative writing", "editing", "content strategy"
+    ],
+    "telecalling": [
+      "cold calling", "tele sales", "phone sales", "outbound calling",
+      "lead calling", "customer calling", "sales calls", "telemarketing"
+    ],
+    "customer acquisition": [
+      "lead generation", "sales", "business development", "client acquisition",
+      "prospecting", "outreach", "conversion", "growth"
+    ],
+    "marketing": [
+      "brand management", "campaigns", "advertising", "promotion", "market research",
+      "product marketing", "communications", "strategy", "planning"
+    ]
+  },
+  
+  "General Roles": {
+    "data entry": [
+      "typing", "data processing", "excel", "spreadsheet", "ms office",
+      "data management", "accuracy", "computer skills", "documentation",
+      "record keeping", "database entry"
+    ],
+    "admin": [
+      "administration", "office management", "coordination", "scheduling",
+      "correspondence", "filing", "documentation", "ms office", "organization",
+      "administrative support", "office work", "clerical"
+    ],
+    "management trainee": [
+      "management", "operations", "business", "leadership", "training",
+      "graduate trainee", "mba", "business management", "operations management"
+    ],
+    "executive assistant": [
+      "assistant", "coordination", "scheduling", "calendar management",
+      "email management", "meeting coordination", "travel planning",
+      "administrative support", "office management"
+    ],
+    "operations": [
+      "operations management", "coordination", "process improvement",
+      "logistics", "planning", "execution", "operations support",
+      "workflow management", "efficiency"
+    ],
+    "customer support": [
+      "customer service", "help desk", "client support", "support executive",
+      "problem solving", "communication", "query resolution", "crm",
+      "customer care", "support services"
+    ],
+    "front office": [
+      "reception", "front desk", "visitor management", "phone handling",
+      "correspondence", "office administration", "customer interaction"
+    ],
+    "coordination": [
+      "project coordination", "team coordination", "scheduling", "planning",
+      "organizing", "liaison", "communication", "administrative coordination"
+    ]
+  },
+  
+  "Accounting, Finance and Purchase": {
+    "accounting": [
+      "accounts", "bookkeeping", "ledger", "journal entries", "financial accounting",
+      "tally", "quickbooks", "gst", "taxation", "reconciliation", "balance sheet",
+      "profit loss", "financial statements", "accounting software"
+    ],
+    "finance": [
+      "financial analysis", "budgeting", "financial planning", "investment",
+      "financial management", "cash flow", "financial modeling", "excel",
+      "financial reporting", "analysis", "forecasting"
+    ],
+    "accounts payable": [
+      "ap", "vendor payments", "invoice processing", "payment processing",
+      "accounts management", "reconciliation", "expense management"
+    ],
+    "accounts receivable": [
+      "ar", "collections", "invoicing", "payment collection", "customer accounts",
+      "credit control", "receivables management"
+    ],
+    "financial analyst": [
+      "financial analysis", "data analysis", "reporting", "excel", "modeling",
+      "forecasting", "budgeting", "variance analysis", "financial planning"
+    ],
+    "purchase": [
+      "procurement", "vendor management", "purchasing", "sourcing", "negotiation",
+      "supplier management", "purchase orders", "inventory", "cost reduction",
+      "vendor negotiation", "buying"
+    ],
+    "taxation": [
+      "tax", "gst", "income tax", "tds", "tax filing", "tax compliance",
+      "tax returns", "tax planning", "indirect tax", "direct tax"
+    ],
+    "tally": [
+      "tally erp", "accounting software", "bookkeeping", "accounts", "gst",
+      "inventory management", "tally prime"
+    ],
+    "tender": [
+      "tender management", "bidding", "quotations", "rfp", "rfq", "procurement",
+      "proposal", "government tenders", "tender documentation"
+    ],
+    "audit": [
+      "auditing", "internal audit", "compliance", "financial audit", "sox",
+      "audit procedures", "risk assessment", "audit reporting"
+    ]
+  },
+  
+  "Legal": {
+    "legal": [
+      "law", "legal compliance", "contracts", "legal documentation", "legal research",
+      "legal advisory", "legal drafting", "legal affairs", "regulations"
+    ],
+    "compliance": [
+      "regulatory compliance", "legal compliance", "corporate compliance",
+      "compliance management", "policies", "procedures", "audit", "regulations"
+    ],
+    "contracts": [
+      "contract management", "contract drafting", "agreement", "legal documents",
+      "contract review", "negotiation", "vendor contracts", "mou"
+    ],
+    "documentation": [
+      "legal documentation", "document management", "filing", "records",
+      "legal papers", "documentation support", "legal correspondence"
+    ],
+    "corporate law": [
+      "corporate legal", "company law", "corporate governance", "board matters",
+      "corporate compliance", "corporate affairs"
+    ],
+    "intellectual property": [
+      "ip", "patent", "trademark", "copyright", "ip law", "ip rights",
+      "ip protection", "licensing"
+    ],
+    "litigation": [
+      "legal proceedings", "court cases", "legal disputes", "arbitration",
+      "litigation support", "legal representation"
+    ],
+    "tender": [
+      "tender management", "tender documentation", "legal tender", "bid preparation",
+      "rfp", "rfq", "government tenders", "tender compliance"
+    ],
+    "admin": [
+      "legal admin", "administrative support", "office management", "coordination",
+      "legal administrative", "legal office management"
+    ]
+  }
+}

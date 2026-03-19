@@ -149,7 +149,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://mumbai121-host1.vercel.app",
+        "https://www.mumbai121.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -727,19 +732,6 @@ def get_companies():
             ).limit(12)
         )
         return companies
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/stats")
-def get_stats():
-    """Public stats endpoint for homepage counters."""
-    try:
-        return {
-            "freshers":  db.Freshers.count_documents({}),
-            "pwbd":      db.PwBDs.count_documents({}),
-            "companies": db.Requirements.count_documents({}),
-        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

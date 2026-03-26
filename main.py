@@ -362,7 +362,9 @@ def send_email_with_resumes(to_email: str, company_name: str,
                 print(f"⚠️  Could not attach resume for {label} {i}: {e}")
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.ehlo()
+            server.starttls()
             server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             server.send_message(msg)
         print(f"✅ Email sent to {to_email} — "
@@ -392,7 +394,9 @@ def send_no_candidates_email(to_email: str, company_name: str) -> bool:
         </body></html>
         """
         msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.ehlo()
+            server.starttls()
             server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             server.send_message(msg)
         return True

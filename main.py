@@ -3,17 +3,15 @@
 #  Stack: FastAPI + PyMongo (sync) + Gunicorn + Uvicorn workers
 # ============================================================
 
+import base64
 import json
 import pickle
-import smtplib
 import threading
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from email import encoders
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+
+import resend
 
 import gridfs
 import pymongo
@@ -28,9 +26,11 @@ import os
 # ── ENV ───────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-MONGO_URI      = os.getenv("MONGO_URI")
-EMAIL_ADDRESS  = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+MONGO_URI        = os.getenv("MONGO_URI")
+EMAIL_ADDRESS    = os.getenv("EMAIL_ADDRESS")
+RESEND_API_KEY   = os.getenv("RESEND_API_KEY")
+
+resend.api_key = RESEND_API_KEY
 
 # ── MONGODB ───────────────────────────────────────────────────────────────────
 client = pymongo.MongoClient(
@@ -315,11 +315,6 @@ def generate_html_table(candidates: list, candidate_type: str) -> str:
 
 def send_email_with_resumes(to_email: str, company_name: str,
                              fresher_candidates: list, pwbd_candidates: list) -> bool:
-    msg = MIMEMultipart("mixed")
-    msg["Subject"] = f"Matched Candidates for {company_name}"
-    msg["From"]    = EMAIL_ADDRESS
-    msg["To"]      = to_email
-
     body = f"""
     <html><body>
         <p>Hello {company_name},</p>
@@ -333,11 +328,9 @@ def send_email_with_resumes(to_email: str, company_name: str,
         <p>Best Regards,<br>The Mumbai121 Team</p>
     </body></html>
     """
-    msg_body = MIMEMultipart("alternative")
-    msg_body.attach(MIMEText(body, "html"))
-    msg.attach(msg_body)
 
-    # Attach resumes
+    # Build attachments list for Resend
+    attachments = []
     for label, candidates in [("Fresher", fresher_candidates),
                                ("PwBD",   pwbd_candidates)]:
         for i, c in enumerate(candidates, 1):
@@ -347,22 +340,24 @@ def send_email_with_resumes(to_email: str, company_name: str,
             try:
                 resume_file = get_resume_from_gridfs(resume_id)
                 if resume_file:
-                    name     = c.get("name") or c.get("fullName", f"{label}_{i}")
-                    part     = MIMEBase("application", "pdf")
-                    part.set_payload(resume_file.read())
-                    encoders.encode_base64(part)
+                    name      = c.get("name") or c.get("fullName", f"{label}_{i}")
                     safe_name = secure_filename(name)
-                    part.add_header("Content-Disposition",
-                                    f'attachment; filename="{safe_name}_{label}_Resume.pdf"')
-                    msg.attach(part)
+                    filename  = f"{safe_name}_{label}_Resume.pdf"
+                    # Resend expects base64-encoded content as a string
+                    encoded   = base64.b64encode(resume_file.read()).decode("utf-8")
+                    attachments.append({"filename": filename, "content": encoded})
                     print(f"✅ Attached resume for {name}")
             except Exception as e:
                 print(f"⚠️  Could not attach resume for {label} {i}: {e}")
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.send_message(msg)
+        resend.Emails.send({
+            "from":        f"Mumbai121 <{EMAIL_ADDRESS}>",
+            "to":          [to_email],
+            "subject":     f"Matched Candidates for {company_name}",
+            "html":        body,
+            "attachments": attachments,
+        })
         print(f"✅ Email sent to {to_email} — "
               f"{len(fresher_candidates)} freshers, {len(pwbd_candidates)} PwBDs")
         return True
@@ -374,10 +369,6 @@ def send_email_with_resumes(to_email: str, company_name: str,
 
 def send_no_candidates_email(to_email: str, company_name: str) -> bool:
     try:
-        msg = MIMEMultipart()
-        msg["Subject"] = f"No Additional Candidates Available — {company_name}"
-        msg["From"]    = EMAIL_ADDRESS
-        msg["To"]      = to_email
         body = f"""
         <html><body>
             <h2>Hello {company_name},</h2>
@@ -389,10 +380,12 @@ def send_no_candidates_email(to_email: str, company_name: str) -> bool:
             <p>Best regards,<br>The Mumbai121 Team</p>
         </body></html>
         """
-        msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.send_message(msg)
+        resend.Emails.send({
+            "from":    f"Mumbai121 <{EMAIL_ADDRESS}>",
+            "to":      [to_email],
+            "subject": f"No Additional Candidates Available — {company_name}",
+            "html":    body,
+        })
         return True
     except Exception as e:
         print(f"❌ No-candidates email error: {e}")

@@ -5,15 +5,17 @@
 
 import json
 import pickle
-import smtplib
 import threading
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from email import encoders
+import base64
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email import encoders
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
 
 import gridfs
 import pymongo
@@ -30,7 +32,8 @@ load_dotenv()
 
 MONGO_URI      = os.getenv("MONGO_URI")
 EMAIL_ADDRESS  = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_PASSWORD     = os.getenv("EMAIL_PASSWORD")
+SENDGRID_API_KEY   = os.getenv("SENDGRID_API_KEY")
 
 # ── MONGODB ───────────────────────────────────────────────────────────────────
 client = pymongo.MongoClient(
@@ -317,11 +320,6 @@ def generate_html_table(candidates: list, candidate_type: str) -> str:
 
 def send_email_with_resumes(to_email: str, company_name: str,
                              fresher_candidates: list, pwbd_candidates: list) -> bool:
-    msg = MIMEMultipart("mixed")
-    msg["Subject"] = f"Matched Candidates for {company_name}"
-    msg["From"]    = EMAIL_ADDRESS
-    msg["To"]      = to_email
-
     body = f"""
     <html><body>
         <p>Hello {company_name},</p>
@@ -335,40 +333,41 @@ def send_email_with_resumes(to_email: str, company_name: str,
         <p>Best Regards,<br>The Mumbai121 Team</p>
     </body></html>
     """
-    msg_body = MIMEMultipart("alternative")
-    msg_body.attach(MIMEText(body, "html"))
-    msg.attach(msg_body)
-
-    # Attach resumes
-    for label, candidates in [("Fresher", fresher_candidates),
-                               ("PwBD",   pwbd_candidates)]:
-        for i, c in enumerate(candidates, 1):
-            resume_id = c.get("resumeFileId")
-            if not resume_id:
-                continue
-            try:
-                resume_file = get_resume_from_gridfs(resume_id)
-                if resume_file:
-                    name     = c.get("name") or c.get("fullName", f"{label}_{i}")
-                    part     = MIMEBase("application", "pdf")
-                    part.set_payload(resume_file.read())
-                    encoders.encode_base64(part)
-                    safe_name = secure_filename(name)
-                    part.add_header("Content-Disposition",
-                                    f'attachment; filename="{safe_name}_{label}_Resume.pdf"')
-                    msg.attach(part)
-                    print(f"✅ Attached resume for {name}")
-            except Exception as e:
-                print(f"⚠️  Could not attach resume for {label} {i}: {e}")
 
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.send_message(msg)
-        print(f"✅ Email sent to {to_email} — "
-              f"{len(fresher_candidates)} freshers, {len(pwbd_candidates)} PwBDs")
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        message = Mail(
+            from_email=EMAIL_ADDRESS,
+            to_emails=to_email,
+            subject=f"Matched Candidates for {company_name}",
+            html_content=body,
+        )
+        # Attach resumes
+        for label, candidates in [("Fresher", fresher_candidates), ("PwBD", pwbd_candidates)]:
+            for i, c in enumerate(candidates, 1):
+                resume_id = c.get("resumeFileId")
+                if not resume_id:
+                    continue
+                try:
+                    resume_file = get_resume_from_gridfs(resume_id)
+                    if resume_file:
+                        name = c.get("name") or c.get("fullName", f"{label}_{i}")
+                        safe_name = secure_filename(name)
+                        file_data = resume_file.read()
+                        encoded = base64.b64encode(file_data).decode()
+                        attachment = Attachment(
+                            FileContent(encoded),
+                            FileName(f"{safe_name}_{label}_Resume.pdf"),
+                            FileType("application/pdf"),
+                            Disposition("attachment"),
+                        )
+                        message.attachment = attachment
+                        print(f"✅ Attached resume for {name}")
+                except Exception as e:
+                    print(f"⚠️  Could not attach resume for {label} {i}: {e}")
+
+        sg.send(message)
+        print(f"✅ Email sent to {to_email} — {len(fresher_candidates)} freshers, {len(pwbd_candidates)} PwBDs")
         return True
     except Exception as e:
         print(f"❌ Email failed: {e}")
@@ -378,10 +377,6 @@ def send_email_with_resumes(to_email: str, company_name: str,
 
 def send_no_candidates_email(to_email: str, company_name: str) -> bool:
     try:
-        msg = MIMEMultipart()
-        msg["Subject"] = f"No Additional Candidates Available — {company_name}"
-        msg["From"]    = EMAIL_ADDRESS
-        msg["To"]      = to_email
         body = f"""
         <html><body>
             <h2>Hello {company_name},</h2>
@@ -393,12 +388,14 @@ def send_no_candidates_email(to_email: str, company_name: str) -> bool:
             <p>Best regards,<br>The Mumbai121 Team</p>
         </body></html>
         """
-        msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.send_message(msg)
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        message = Mail(
+            from_email=EMAIL_ADDRESS,
+            to_emails=to_email,
+            subject=f"No Additional Candidates Available — {company_name}",
+            html_content=body,
+        )
+        sg.send(message)
         return True
     except Exception as e:
         print(f"❌ No-candidates email error: {e}")

@@ -1,11 +1,8 @@
 [phases.setup]
-nixPkgs = ["stdenv.cc.cc.lib", "libgcc"]
+nixPkgs = ["stdenv.cc.cc.lib"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]
 
-[phases.build]
-cmds = ["find /nix/store -name 'libgomp.so.1' 2>/dev/null | head -5 || echo 'not found yet'"]
-
 [start]
-cmd = "export LD_LIBRARY_PATH=$(find /nix/store -name 'libgomp.so.1' 2>/dev/null | head -1 | xargs dirname):$LD_LIBRARY_PATH && python -m gunicorn -c gunicorn.conf.py main:app"
+cmd = "python -m gunicorn -c gunicorn.conf.py main:app"

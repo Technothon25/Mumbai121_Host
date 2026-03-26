@@ -81,24 +81,51 @@ ML_MODEL      = None
 ML_VECTORIZER = None
 
 def load_ml_model():
+    """
+    Train a fresh model from the JSON training data at startup.
+    This avoids loading a .pkl (which triggers libgomp via compiled sklearn).
+    sklearn itself is fine — only unpickling a pre-compiled model needs libgomp.
+    """
     global ML_MODEL, ML_VECTORIZER
-    model_path = "mumbai121_candidate_ranker.pkl"
-    if os.path.exists(model_path):
-        try:
-            with open(model_path, "rb") as f:
-                model_data = pickle.load(f)
-            ML_MODEL      = model_data["model"]
-            ML_VECTORIZER = model_data["vectorizer"]
-            print("✅ ML model loaded successfully!")
-            print(f"   Training size : {model_data.get('training_size', 'Unknown')}")
-            print(f"   Test R² Score : {model_data.get('test_r2', 0):.3f}")
-            print(f"   Features      : {model_data.get('feature_count', 0)}")
-            return True
-        except Exception as e:
-            print(f"⚠️  Error loading ML model: {e} — using fallback ranking")
+    training_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "mumbai121_training_data_real.json")
+    if not os.path.exists(training_file):
+        print("⚠️  Training data not found — using fallback ranking")
+        return False
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.ensemble import RandomForestRegressor
+        import numpy as np
+
+        with open(training_file, "r", encoding="utf-8") as f:
+            training_data = json.load(f)
+
+        if len(training_data) < 10:
+            print("⚠️  Not enough training data — using fallback ranking")
             return False
-    print("⚠️  ML model file not found — using fallback ranking")
-    return False
+
+        texts  = [d["job_description"] + " " + d["candidate_skills"] for d in training_data]
+        scores = [d["relevance_score"] for d in training_data]
+
+        vectorizer = TfidfVectorizer(max_features=200, ngram_range=(1, 2),
+                                     min_df=2, max_df=0.8)
+        X = vectorizer.fit_transform(texts).toarray()
+        y = np.array(scores)
+
+        model = RandomForestRegressor(
+            n_estimators=100, max_depth=15,
+            min_samples_split=5, min_samples_leaf=2,
+            random_state=42, n_jobs=1   # n_jobs=1 avoids OpenMP entirely
+        )
+        model.fit(X, y)
+
+        ML_MODEL      = model
+        ML_VECTORIZER = vectorizer
+        print(f"✅ ML model trained at startup on {len(training_data)} examples!")
+        return True
+    except Exception as e:
+        print(f"⚠️  Error training ML model: {e} — using fallback ranking")
+        return False
 
 # ── SKILL KEYWORDS ────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))

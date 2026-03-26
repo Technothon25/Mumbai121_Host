@@ -5,7 +5,7 @@
 
 import json
 import pickle
-import smtplib
+import base64
 import threading
 import traceback
 from contextlib import asynccontextmanager
@@ -28,9 +28,17 @@ import os
 # ── ENV ───────────────────────────────────────────────────────────────────────
 load_dotenv()
 
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import (
+    Mail, Attachment, FileContent, FileName,
+    FileType, Disposition, To
+)
+
 MONGO_URI      = os.getenv("MONGO_URI")
 EMAIL_ADDRESS  = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+
 
 # ── MONGODB ───────────────────────────────────────────────────────────────────
 client = pymongo.MongoClient(
@@ -42,6 +50,7 @@ client = pymongo.MongoClient(
 )
 db = client.Mumbai121
 fs = gridfs.GridFS(db)
+
 
 # ── FILE CONFIG ───────────────────────────────────────────────────────────────
 ALLOWED_EXTENSIONS = {"pdf"}
@@ -315,69 +324,67 @@ def generate_html_table(candidates: list, candidate_type: str) -> str:
 
 def send_email_with_resumes(to_email: str, company_name: str,
                              fresher_candidates: list, pwbd_candidates: list) -> bool:
-    msg = MIMEMultipart("mixed")
-    msg["Subject"] = f"Matched Candidates for {company_name}"
-    msg["From"]    = EMAIL_ADDRESS
-    msg["To"]      = to_email
-
-    body = f"""
-    <html><body>
-        <p>Hello {company_name},</p>
-        <p>We have searched our database and found the following freshers who match
-           your job profile. Please find their details below:</p>
-        {generate_html_table(fresher_candidates, "fresher")}
-        <p>We are also sending you the details of PwBD candidates who match your
-           job profile:</p>
-        {generate_html_table(pwbd_candidates, "pwbd")}
-        <p><strong>Note:</strong> Resumes for all candidates are attached.</p>
-        <p>Best Regards,<br>The Mumbai121 Team</p>
-    </body></html>
-    """
-    msg_body = MIMEMultipart("alternative")
-    msg_body.attach(MIMEText(body, "html"))
-    msg.attach(msg_body)
-
-    # Attach resumes
-    for label, candidates in [("Fresher", fresher_candidates),
-                               ("PwBD",   pwbd_candidates)]:
-        for i, c in enumerate(candidates, 1):
-            resume_id = c.get("resumeFileId")
-            if not resume_id:
-                continue
-            try:
-                resume_file = get_resume_from_gridfs(resume_id)
-                if resume_file:
-                    name     = c.get("name") or c.get("fullName", f"{label}_{i}")
-                    part     = MIMEBase("application", "pdf")
-                    part.set_payload(resume_file.read())
-                    encoders.encode_base64(part)
-                    safe_name = secure_filename(name)
-                    part.add_header("Content-Disposition",
-                                    f'attachment; filename="{safe_name}_{label}_Resume.pdf"')
-                    msg.attach(part)
-                    print(f"✅ Attached resume for {name}")
-            except Exception as e:
-                print(f"⚠️  Could not attach resume for {label} {i}: {e}")
-
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.send_message(msg)
-        print(f"✅ Email sent to {to_email} — "
+        body = f"""
+        <html><body>
+            <p>Hello {company_name},</p>
+            <p>We have searched our database and found the following freshers who match
+               your job profile. Please find their details below:</p>
+            {generate_html_table(fresher_candidates, "fresher")}
+            <p>We are also sending you the details of PwBD candidates who match your
+               job profile:</p>
+            {generate_html_table(pwbd_candidates, "pwbd")}
+            <p><strong>Note:</strong> Resumes for all candidates are attached.</p>
+            <p>Best Regards,<br>The Mumbai121 Team</p>
+        </body></html>
+        """
+ 
+        message = Mail(
+            from_email=EMAIL_ADDRESS,
+            to_emails=to_email,
+            subject=f"Matched Candidates for {company_name}",
+            html_content=body,
+        )
+ 
+        # Attach resumes
+        for label, candidates in [("Fresher", fresher_candidates),
+                                   ("PwBD",   pwbd_candidates)]:
+            for i, c in enumerate(candidates, 1):
+                resume_id = c.get("resumeFileId")
+                if not resume_id:
+                    continue
+                try:
+                    resume_file = get_resume_from_gridfs(resume_id)
+                    if resume_file:
+                        name      = c.get("name") or c.get("fullName", f"{label}_{i}")
+                        safe_name = secure_filename(name)
+                        pdf_data  = base64.b64encode(resume_file.read()).decode()
+ 
+                        attachment = Attachment(
+                            FileContent(pdf_data),
+                            FileName(f"{safe_name}_{label}_Resume.pdf"),
+                            FileType("application/pdf"),
+                            Disposition("attachment"),
+                        )
+                        message.add_attachment(attachment)
+                        print(f"✅ Attached resume for {name}")
+                except Exception as e:
+                    print(f"⚠️  Could not attach resume for {label} {i}: {e}")
+ 
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"✅ Email sent to {to_email} via SendGrid (status {response.status_code}) — "
               f"{len(fresher_candidates)} freshers, {len(pwbd_candidates)} PwBDs")
         return True
+ 
     except Exception as e:
         print(f"❌ Email failed: {e}")
         traceback.print_exc()
         return False
-
-
+ 
+ 
 def send_no_candidates_email(to_email: str, company_name: str) -> bool:
     try:
-        msg = MIMEMultipart()
-        msg["Subject"] = f"No Additional Candidates Available — {company_name}"
-        msg["From"]    = EMAIL_ADDRESS
-        msg["To"]      = to_email
         body = f"""
         <html><body>
             <h2>Hello {company_name},</h2>
@@ -389,15 +396,21 @@ def send_no_candidates_email(to_email: str, company_name: str) -> bool:
             <p>Best regards,<br>The Mumbai121 Team</p>
         </body></html>
         """
-        msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.send_message(msg)
+        message = Mail(
+            from_email=EMAIL_ADDRESS,
+            to_emails=to_email,
+            subject=f"No Additional Candidates Available — {company_name}",
+            html_content=body,
+        )
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"✅ No-candidates email sent to {to_email} (status {response.status_code})")
         return True
+ 
     except Exception as e:
         print(f"❌ No-candidates email error: {e}")
+        traceback.print_exc()
         return False
-
 
 def process_requirement_internal(requirement_id: str, is_resend: bool = False) -> bool:
     try:

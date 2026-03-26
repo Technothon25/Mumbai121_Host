@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["libgomp"]
+nixPkgs = ["stdenv.cc.cc.lib"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]

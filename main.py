@@ -3,6 +3,33 @@
 #  Stack: FastAPI + PyMongo (sync) + Gunicorn + Uvicorn workers
 # ============================================================
 
+# Fix libgomp.so.1 missing on Railway/Nix — must run before sklearn import
+import os, glob, ctypes
+
+def _fix_libgomp():
+    patterns = [
+        "/nix/store/*/lib/libgomp.so.1",
+        "/nix/store/*/lib/libgomp.so",
+        "/usr/lib/x86_64-linux-gnu/libgomp.so.1",
+        "/usr/lib/libgomp.so.1",
+        "/lib/x86_64-linux-gnu/libgomp.so.1",
+    ]
+    for pattern in patterns:
+        matches = glob.glob(pattern)
+        if matches:
+            lib_dir = os.path.dirname(matches[0])
+            existing = os.environ.get("LD_LIBRARY_PATH", "")
+            os.environ["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}"
+            try:
+                ctypes.CDLL(matches[0])
+                print(f"✅ libgomp loaded from: {matches[0]}")
+            except Exception as e:
+                print(f"⚠️  ctypes load attempt: {e}")
+            return
+    print("⚠️  libgomp.so.1 not found in any known path")
+
+_fix_libgomp()
+
 import base64
 import json
 import pickle

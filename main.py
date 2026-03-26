@@ -3,33 +3,6 @@
 #  Stack: FastAPI + PyMongo (sync) + Gunicorn + Uvicorn workers
 # ============================================================
 
-# Fix libgomp.so.1 missing on Railway/Nix — must run before sklearn import
-import os, glob, ctypes
-
-def _fix_libgomp():
-    patterns = [
-        "/nix/store/*/lib/libgomp.so.1",
-        "/nix/store/*/lib/libgomp.so",
-        "/usr/lib/x86_64-linux-gnu/libgomp.so.1",
-        "/usr/lib/libgomp.so.1",
-        "/lib/x86_64-linux-gnu/libgomp.so.1",
-    ]
-    for pattern in patterns:
-        matches = glob.glob(pattern)
-        if matches:
-            lib_dir = os.path.dirname(matches[0])
-            existing = os.environ.get("LD_LIBRARY_PATH", "")
-            os.environ["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}"
-            try:
-                ctypes.CDLL(matches[0])
-                print(f"✅ libgomp loaded from: {matches[0]}")
-            except Exception as e:
-                print(f"⚠️  ctypes load attempt: {e}")
-            return
-    print("⚠️  libgomp.so.1 not found in any known path")
-
-_fix_libgomp()
-
 import base64
 import json
 import pickle
@@ -112,11 +85,8 @@ def load_ml_model():
         X = vectorizer.fit_transform(texts).toarray()
         y = np.array(scores)
 
-        model = RandomForestRegressor(
-            n_estimators=100, max_depth=15,
-            min_samples_split=5, min_samples_leaf=2,
-            random_state=42, n_jobs=1   # n_jobs=1 avoids OpenMP entirely
-        )
+        from sklearn.linear_model import Ridge
+        model = Ridge(alpha=1.0)   # Pure Python — zero OpenMP/libgomp dependency
         model.fit(X, y)
 
         ML_MODEL      = model

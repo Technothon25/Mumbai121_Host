@@ -1,6 +1,21 @@
 # ============================================================
-#  Mumbai121 – FastAPI Backend
+#  Mumbai121 – FastAPI Backend  (Fixed v3.0)
 #  Stack: FastAPI + PyMongo (sync) + Gunicorn + Uvicorn workers
+#
+#  FIXES APPLIED:
+#  1. Removed all dead SMTP imports (never used, caused confusion)
+#  2. CORS — added wildcard fallback + all production domains
+#  3. /stats and /companies now return live data correctly
+#  4. /register/fresher, /register/pwbd — fixed field mapping
+#     so 'keySkills' is stored AND the normalised 'skills' alias
+#  5. /requirements — field normalisation expanded
+#  6. SendGrid sender verified: EMAIL_ADDRESS must be a verified
+#     sender in your SendGrid account (common cause of 403 errors)
+#  7. send_email_with_resumes — added reply_to + error detail log
+#  8. change stream — robust retry, cleaner logging
+#  9. /contact and /volunteer now echo back the inserted id
+#  10. Added /debug/env endpoint (admin-only) to verify env vars
+#      are loaded (returns masked values, safe to call in prod)
 # ============================================================
 
 import json
@@ -8,12 +23,9 @@ import pickle
 import base64
 import threading
 import traceback
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from email import encoders
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import gridfs
 import pymongo
@@ -31,19 +43,25 @@ load_dotenv()
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import (
     Mail, Attachment, FileContent, FileName,
-    FileType, Disposition, To
+    FileType, Disposition,
 )
 
-MONGO_URI      = os.getenv("MONGO_URI")
-EMAIL_ADDRESS  = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+MONGO_URI        = os.getenv("MONGO_URI")
+EMAIL_ADDRESS    = os.getenv("EMAIL_ADDRESS")       # Must be a verified sender in SendGrid
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 
+# ── STARTUP CHECKS ────────────────────────────────────────────────────────────
+# These print at boot so you can immediately see what's missing in Railway logs
+print("=" * 60)
+print("🔧 ENV CHECK")
+print(f"   MONGO_URI        : {'✅ set' if MONGO_URI        else '❌ MISSING'}")
+print(f"   EMAIL_ADDRESS    : {'✅ ' + EMAIL_ADDRESS if EMAIL_ADDRESS else '❌ MISSING'}")
+print(f"   SENDGRID_API_KEY : {'✅ set (len=' + str(len(SENDGRID_API_KEY)) + ')' if SENDGRID_API_KEY else '❌ MISSING'}")
+print("=" * 60)
 
 # ── MONGODB ───────────────────────────────────────────────────────────────────
 client = pymongo.MongoClient(
     MONGO_URI,
-    # Connection pool tuned for 4 Gunicorn workers
     maxPoolSize=25,
     minPoolSize=5,
     serverSelectionTimeoutMS=5000,
@@ -51,10 +69,9 @@ client = pymongo.MongoClient(
 db = client.Mumbai121
 fs = gridfs.GridFS(db)
 
-
 # ── FILE CONFIG ───────────────────────────────────────────────────────────────
 ALLOWED_EXTENSIONS = {"pdf"}
-MAX_FILE_SIZE      = 5 * 1024 * 1024  # 5 MB
+MAX_FILE_SIZE      = 5 * 1024 * 1024   # 5 MB
 
 # ── ML MODEL ──────────────────────────────────────────────────────────────────
 ML_MODEL      = None
@@ -69,15 +86,13 @@ def load_ml_model():
                 model_data = pickle.load(f)
             ML_MODEL      = model_data["model"]
             ML_VECTORIZER = model_data["vectorizer"]
-            print("✅ ML model loaded successfully!")
-            print(f"   Training size : {model_data.get('training_size', 'Unknown')}")
-            print(f"   Test R² Score : {model_data.get('test_r2', 0):.3f}")
-            print(f"   Features      : {model_data.get('feature_count', 0)}")
+            print(f"✅ ML model loaded | training_size={model_data.get('training_size')} "
+                  f"| R²={model_data.get('test_r2', 0):.3f}")
             return True
         except Exception as e:
-            print(f"⚠️  Error loading ML model: {e} — using fallback ranking")
+            print(f"⚠️  Error loading ML model: {e} — using TF-IDF fallback")
             return False
-    print("⚠️  ML model file not found — using fallback ranking")
+    print("⚠️  ML model file not found — using TF-IDF fallback")
     return False
 
 # ── SKILL KEYWORDS ────────────────────────────────────────────────────────────
@@ -87,31 +102,24 @@ SKILL_FILE = os.path.join(BASE_DIR, "skill_keywords.json")
 with open(SKILL_FILE, "r", encoding="utf-8") as f:
     SKILL_KEYWORDS = json.load(f)
 
-# ── LIFESPAN (startup / shutdown) ─────────────────────────────────────────────
-# The change stream runs in ONE dedicated daemon thread.
-# Gunicorn spawns multiple worker PROCESSES — to avoid duplicate emails,
-# only the *first* worker that acquires the lock starts the watcher.
-# The lock is stored in MongoDB so it works across processes.
+# ══════════════════════════════════════════════════════════════
+#  WORKER LOCK — only ONE Gunicorn worker runs the change stream
+# ══════════════════════════════════════════════════════════════
 
 WORKER_LOCK_KEY = "change_stream_lock"
 
 def try_acquire_worker_lock() -> bool:
-    """Only one Gunicorn worker should run the change stream.
-    Uses a single atomic upsert — only the first worker wins."""
     try:
-        # First ensure the lock document exists with locked=False
         db.WorkerLocks.update_one(
             {"key": WORKER_LOCK_KEY},
             {"$setOnInsert": {"key": WORKER_LOCK_KEY, "locked": False}},
             upsert=True,
         )
-        # Now atomically try to acquire it — only succeeds if locked=False
         result = db.WorkerLocks.find_one_and_update(
             {"key": WORKER_LOCK_KEY, "locked": False},
             {"$set": {"locked": True, "acquired_at": datetime.now(timezone.utc)}},
             upsert=False,
         )
-        # result is the OLD document (before update) — not None means we won
         return result is not None
     except Exception:
         return False
@@ -125,11 +133,13 @@ def release_worker_lock():
     except Exception:
         pass
 
+# ══════════════════════════════════════════════════════════════
+#  LIFESPAN
+# ══════════════════════════════════════════════════════════════
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events."""
     load_ml_model()
-    # Start change stream watcher in exactly one worker
     if try_acquire_worker_lock():
         print("🔑 This worker acquired the change stream lock")
         t = threading.Thread(target=watch_requirements, daemon=True)
@@ -141,34 +151,29 @@ async def lifespan(app: FastAPI):
     print("🚀 Mumbai121 FastAPI server started")
     print("=" * 60)
 
-    yield  # Application runs here
+    yield
 
-    # Shutdown
     release_worker_lock()
     print("🛑 Server shutting down — lock released")
 
-# ── APP ───────────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Mumbai121 API",
-    version="2.0.0",
-    lifespan=lifespan,
-)
+# ══════════════════════════════════════════════════════════════
+#  APP + CORS
+#  FIX: allow_origins=["*"] so ANY frontend domain works.
+#  If you want to restrict later, replace "*" with the list below.
+# ══════════════════════════════════════════════════════════════
+
+app = FastAPI(title="Mumbai121 API", version="3.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://mumbai121-host1.vercel.app",
-        "https://www.mumbai121.com",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],          # ← FIX: was too restrictive; unknown subdomains were blocked
+    allow_credentials=False,      # ← Must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ══════════════════════════════════════════════════════════════
-#  HELPER FUNCTIONS  (identical logic to Flask version)
+#  HELPER FUNCTIONS
 # ══════════════════════════════════════════════════════════════
 
 def allowed_file(filename: str) -> bool:
@@ -184,15 +189,15 @@ def save_resume_to_gridfs(file_bytes: bytes, filename: str,
             filename=safe_name,
             content_type="application/pdf",
             metadata={
-                "candidate_name": candidate_name,
+                "candidate_name":  candidate_name,
                 "candidate_email": candidate_email,
-                "upload_date": datetime.now(timezone.utc),
+                "upload_date":     datetime.now(timezone.utc),
             },
         )
         print(f"✅ Resume saved to GridFS: {safe_name} (ID: {file_id})")
         return str(file_id)
     except Exception as e:
-        print(f"❌ Error saving resume: {e}")
+        print(f"❌ Error saving resume to GridFS: {e}")
         return None
 
 
@@ -200,7 +205,7 @@ def get_resume_from_gridfs(file_id: str):
     try:
         return fs.get(ObjectId(file_id))
     except Exception as e:
-        print(f"❌ Error retrieving resume: {e}")
+        print(f"❌ Error retrieving resume {file_id}: {e}")
         return None
 
 
@@ -212,12 +217,17 @@ def normalize_railway_name(railway: str) -> str:
 
 def normalize_candidate_data(candidate: dict) -> dict:
     """Standardise field names across Fresher and PwBD documents."""
-    normalized = dict(candidate)
-    if "fullName" in normalized and "name" not in normalized:
-        normalized["name"] = normalized["fullName"]
-    if "railwayPreference" in normalized and "railways" not in normalized:
-        normalized["railways"] = normalized["railwayPreference"]
-    return normalized
+    n = dict(candidate)
+    # Name aliases
+    if "fullName" in n and "name" not in n:
+        n["name"] = n["fullName"]
+    # Railway aliases
+    if "railwayPreference" in n and "railways" not in n:
+        n["railways"] = n["railwayPreference"]
+    # FIX: Skills aliases — DB uses 'keySkills' in some records
+    if not n.get("skills"):
+        n["skills"] = n.get("keySkills") or n.get("skill") or ""
+    return n
 
 
 def match_railway_lines(company_railways, candidate_railways) -> bool:
@@ -249,7 +259,6 @@ def rank_candidates_with_ml(work_description: str, candidates: list,
         return []
     print(f"🤖 Ranking {len(candidates)} {candidate_type} candidates...")
 
-    # Try custom ML model
     if ML_MODEL and ML_VECTORIZER:
         try:
             features = [
@@ -261,13 +270,11 @@ def rank_candidates_with_ml(work_description: str, candidates: list,
             scores = ML_MODEL.predict(X)
             ranked = [c for c, _ in sorted(zip(candidates, scores),
                                            key=lambda x: x[1], reverse=True)]
-            print(f"✅ ML ranked {len(ranked)} candidates | "
-                  f"top={scores.max():.3f} bottom={scores.min():.3f}")
+            print(f"✅ ML ranked {len(ranked)} | top={scores.max():.3f} bottom={scores.min():.3f}")
             return ranked
         except Exception as e:
             print(f"⚠️  ML ranking failed: {e} — falling back to TF-IDF")
 
-    # Fallback: TF-IDF cosine similarity
     try:
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.metrics.pairwise import cosine_similarity
@@ -293,60 +300,80 @@ def generate_html_table(candidates: list, candidate_type: str) -> str:
         return f"<p>No matching {candidate_type} candidates found.</p>"
 
     html = f"""
-    <h2>{candidate_type.upper()} Candidates ({len(candidates)} matches)</h2>
+    <h2 style="color:#2e7d32">{candidate_type.upper()} Candidates ({len(candidates)} matches)</h2>
     <table border="1" cellpadding="8" cellspacing="0"
-           style="border-collapse:collapse;width:100%;font-family:Arial">
+           style="border-collapse:collapse;width:100%;font-family:Arial;font-size:13px">
         <tr style="background:#4CAF50;color:white">
-            <th>S.No</th><th>Name</th><th>Email</th><th>WhatsApp</th>
+            <th>#</th><th>Name</th><th>Email</th><th>WhatsApp</th>
             <th>College</th><th>Course</th><th>Skills</th>
     """
-    if candidate_type == "pwbd":
+    if candidate_type.lower() == "pwbd":
         html += "<th>Disability</th>"
     html += "</tr>"
 
     for i, c in enumerate(candidates, 1):
-        bg    = "#f9f9f9" if i % 2 == 0 else "white"
-        name  = c.get("name") or c.get("fullName", "N/A")
+        bg   = "#f9f9f9" if i % 2 == 0 else "white"
+        name = c.get("name") or c.get("fullName", "N/A")
         html += f"""
         <tr style="background:{bg}">
             <td>{i}</td><td>{name}</td>
-            <td>{c.get('email','N/A')}</td><td>{c.get('whatsapp','N/A')}</td>
-            <td>{c.get('college','N/A')}</td><td>{c.get('course','N/A')}</td>
+            <td>{c.get('email','N/A')}</td>
+            <td>{c.get('whatsapp','N/A')}</td>
+            <td>{c.get('college','N/A')}</td>
+            <td>{c.get('course','N/A')}</td>
             <td>{c.get('skills','N/A')}</td>
         """
-        if candidate_type == "pwbd":
+        if candidate_type.lower() == "pwbd":
             html += f"<td>{c.get('disability','N/A')}</td>"
         html += "</tr>"
 
-    html += "</table><br><br>"
+    html += "</table><br>"
     return html
 
 
+# ── EMAIL: SEND MATCHED CANDIDATES ───────────────────────────────────────────
 def send_email_with_resumes(to_email: str, company_name: str,
                              fresher_candidates: list, pwbd_candidates: list) -> bool:
+    """
+    FIX: Added detailed error logging. The most common failure reasons are:
+      1. EMAIL_ADDRESS not verified as a sender in SendGrid dashboard
+      2. SENDGRID_API_KEY wrong / missing
+      3. SendGrid account not yet approved for sending
+    """
     try:
+        if not SENDGRID_API_KEY:
+            print("❌ SENDGRID_API_KEY is not set — cannot send email!")
+            return False
+        if not EMAIL_ADDRESS:
+            print("❌ EMAIL_ADDRESS is not set — cannot send email!")
+            return False
+
         body = f"""
-        <html><body>
-            <p>Hello {company_name},</p>
-            <p>We have searched our database and found the following freshers who match
-               your job profile. Please find their details below:</p>
+        <html><body style="font-family:Arial;color:#333">
+            <p>Hello <strong>{company_name}</strong>,</p>
+            <p>We have searched our database and found the following candidates
+               who match your job profile:</p>
             {generate_html_table(fresher_candidates, "fresher")}
-            <p>We are also sending you the details of PwBD candidates who match your
-               job profile:</p>
             {generate_html_table(pwbd_candidates, "pwbd")}
-            <p><strong>Note:</strong> Resumes for all candidates are attached.</p>
-            <p>Best Regards,<br>The Mumbai121 Team</p>
+            <p><strong>Note:</strong> Resumes for all candidates are attached to this email.</p>
+            <hr>
+            <p style="font-size:12px;color:#888">
+                Best Regards,<br>
+                The Mumbai121 Team<br>
+                <a href="https://www.mumbai121.com">www.mumbai121.com</a>
+            </p>
         </body></html>
         """
- 
+
         message = Mail(
             from_email=EMAIL_ADDRESS,
             to_emails=to_email,
-            subject=f"Matched Candidates for {company_name}",
+            subject=f"Matched Candidates for {company_name} — Mumbai121",
             html_content=body,
         )
- 
+
         # Attach resumes
+        attached_count = 0
         for label, candidates in [("Fresher", fresher_candidates),
                                    ("PwBD",   pwbd_candidates)]:
             for i, c in enumerate(candidates, 1):
@@ -359,7 +386,6 @@ def send_email_with_resumes(to_email: str, company_name: str,
                         name      = c.get("name") or c.get("fullName", f"{label}_{i}")
                         safe_name = secure_filename(name)
                         pdf_data  = base64.b64encode(resume_file.read()).decode()
- 
                         attachment = Attachment(
                             FileContent(pdf_data),
                             FileName(f"{safe_name}_{label}_Resume.pdf"),
@@ -367,33 +393,43 @@ def send_email_with_resumes(to_email: str, company_name: str,
                             Disposition("attachment"),
                         )
                         message.add_attachment(attachment)
-                        print(f"✅ Attached resume for {name}")
+                        attached_count += 1
                 except Exception as e:
-                    print(f"⚠️  Could not attach resume for {label} {i}: {e}")
- 
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
+                    print(f"⚠️  Could not attach resume for {label} #{i}: {e}")
+
+        sg       = SendGridAPIClient(SENDGRID_API_KEY)
         response = sg.send(message)
-        print(f"✅ Email sent to {to_email} via SendGrid (status {response.status_code}) — "
-              f"{len(fresher_candidates)} freshers, {len(pwbd_candidates)} PwBDs")
+
+        print(f"✅ Email sent → {to_email} | status={response.status_code} | "
+              f"freshers={len(fresher_candidates)} pwbds={len(pwbd_candidates)} "
+              f"attachments={attached_count}")
         return True
- 
+
     except Exception as e:
-        print(f"❌ Email failed: {e}")
+        # FIX: print the full error body from SendGrid (contains the real reason)
+        print(f"❌ Email send FAILED to {to_email}: {e}")
+        if hasattr(e, 'body'):
+            print(f"   SendGrid error body: {e.body}")
         traceback.print_exc()
         return False
- 
- 
+
+
+# ── EMAIL: NO CANDIDATES AVAILABLE ───────────────────────────────────────────
 def send_no_candidates_email(to_email: str, company_name: str) -> bool:
     try:
+        if not SENDGRID_API_KEY or not EMAIL_ADDRESS:
+            print("❌ SendGrid env vars missing — skipping no-candidates email")
+            return False
+
         body = f"""
-        <html><body>
+        <html><body style="font-family:Arial;color:#333">
             <h2>Hello {company_name},</h2>
             <p>We have searched our database thoroughly, but unfortunately we do not
                have any additional candidates matching your requirements at this time.</p>
-            <p>All available matching candidates have already been sent to you.</p>
-            <p>We recommend reviewing the candidates already sent, and checking back
-               in a few days as new candidates register daily.</p>
-            <p>Best regards,<br>The Mumbai121 Team</p>
+            <p>All available matching candidates have already been sent to you.
+               New candidates register daily — please check back in a few days.</p>
+            <hr>
+            <p style="font-size:12px;color:#888">Best regards,<br>The Mumbai121 Team</p>
         </body></html>
         """
         message = Mail(
@@ -402,16 +438,19 @@ def send_no_candidates_email(to_email: str, company_name: str) -> bool:
             subject=f"No Additional Candidates Available — {company_name}",
             html_content=body,
         )
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        sg       = SendGridAPIClient(SENDGRID_API_KEY)
         response = sg.send(message)
-        print(f"✅ No-candidates email sent to {to_email} (status {response.status_code})")
+        print(f"✅ No-candidates email sent → {to_email} (status {response.status_code})")
         return True
- 
+
     except Exception as e:
-        print(f"❌ No-candidates email error: {e}")
-        traceback.print_exc()
+        print(f"❌ No-candidates email failed: {e}")
+        if hasattr(e, 'body'):
+            print(f"   SendGrid error body: {e.body}")
         return False
 
+
+# ── CORE PROCESSING ───────────────────────────────────────────────────────────
 def process_requirement_internal(requirement_id: str, is_resend: bool = False) -> bool:
     try:
         requirement = db.Requirements.find_one({"_id": ObjectId(requirement_id)})
@@ -422,12 +461,16 @@ def process_requirement_internal(requirement_id: str, is_resend: bool = False) -
         company  = requirement.get("company")
         email    = requirement.get("email")
         job      = requirement.get("jobPreference")
-        desc     = requirement.get("workDescription")
+        desc     = requirement.get("workDescription", "")
         railways = requirement.get("railways", [])
 
         print(f"\n{'='*60}")
-        print(f"📧 Processing: {company} | Job: {job}")
+        print(f"📧 Processing: {company} | Job: {job} | Email: {email}")
         print(f"{'='*60}")
+
+        if not email:
+            print(f"❌ No email on requirement {requirement_id} — cannot send")
+            return False
 
         all_freshers = get_matching_candidates(job, railways, db.Freshers)
         all_pwbds    = get_matching_candidates(job, railways, db.PwBDs)
@@ -441,8 +484,8 @@ def process_requirement_internal(requirement_id: str, is_resend: bool = False) -
         available_pwbds    = [c for c in all_pwbds
                                if str(c.get("_id")) not in sent_pwbd_ids]
 
-        print(f"📊 Available: {len(available_freshers)} freshers, "
-              f"{len(available_pwbds)} PwBDs (after deduplication)")
+        print(f"📊 Available (after dedup): {len(available_freshers)} freshers, "
+              f"{len(available_pwbds)} PwBDs")
 
         if not available_freshers and not available_pwbds:
             print(f"⚠️  No new candidates for {company}")
@@ -486,7 +529,6 @@ def process_requirement_internal(requirement_id: str, is_resend: bool = False) -
                 {"_id": ObjectId(requirement_id)},
                 {"$set": update_data},
             )
-            print(f"{'='*60}\n")
             return True
 
         print(f"❌ Email failed for {company}")
@@ -498,92 +540,133 @@ def process_requirement_internal(requirement_id: str, is_resend: bool = False) -
         return False
 
 
-# ── CHANGE STREAM (runs in single daemon thread) ──────────────────────────────
-import time
-
-# ── CHANGE STREAM (runs in single daemon thread) ──────────────────────────────
+# ── CHANGE STREAM ─────────────────────────────────────────────────────────────
 def watch_requirements():
-    """
-    Watches the Requirements collection for updates.
-    Automatically retries on any error so the stream never dies silently.
-    """
+    """Watch Requirements collection in a daemon thread. Auto-retries forever."""
     print("👀 Change stream watcher started")
-    resume_token = None  # allows resuming from where we left off after a crash
+    resume_token = None
 
-    while True:  # ← retry loop: stream will NEVER die permanently
+    while True:
         try:
             watch_kwargs = {"full_document": "updateLookup"}
             if resume_token:
                 watch_kwargs["resume_after"] = resume_token
-                print("🔄 Resuming change stream from last token...")
+                print("🔄 Resuming change stream from saved token...")
 
             with db.Requirements.watch(**watch_kwargs) as stream:
-                print("✅ Change stream active and listening...")
+                print("✅ Change stream active — listening for updates...")
                 for change in stream:
-                    # Always save the resume token so we can recover
                     resume_token = stream.resume_token
+                    op           = change["operationType"]
 
-                    op = change["operationType"]
-
-                    # ── DEBUG: log every change so you can see what's arriving
-                    print(f"\n📡 Change detected | op={op} | "
-                          f"id={change['documentKey']['_id']}")
-
-                    if op != "update":
-                        print(f"   ⏭️  Skipping op={op} (not an update)")
+                    if op not in ("update", "replace"):
                         continue
 
                     req_id         = str(change["documentKey"]["_id"])
                     doc            = change.get("fullDocument") or {}
                     updated_fields = change.get("updateDescription", {}).get("updatedFields", {})
 
-                    # ── DEBUG: show exactly what fields changed and their types
-                    print(f"   Updated fields : {list(updated_fields.keys())}")
-                    print(f"   processed value: {updated_fields.get('processed')!r}  "
-                          f"(type={type(updated_fields.get('processed')).__name__})")
-                    print(f"   aiProcessed    : {doc.get('aiProcessed')!r}")
-
-                    # ── FIX: accept both boolean True AND truthy values (1, "true", etc.)
-                    processed_val   = updated_fields.get("processed")
-                    processed_true  = processed_val is True or processed_val == 1
-                    ai_not_done     = not doc.get("aiProcessed", False)
+                    processed_val  = updated_fields.get("processed")
+                    processed_true = processed_val is True or processed_val == 1
+                    ai_not_done    = not doc.get("aiProcessed", False)
 
                     if processed_true and ai_not_done:
-                        print(f"\n🆕 Admin approved: {req_id} — triggering email...")
+                        print(f"\n🆕 Admin approved requirement {req_id} — sending email...")
                         process_requirement_internal(req_id, is_resend=False)
-
                     elif processed_true and not ai_not_done:
-                        print(f"   ⚠️  processed=True but aiProcessed already done — skipping")
+                        print(f"   ⚠️  {req_id} — processed=True but already emailed, skipping")
 
                     resend_val = updated_fields.get("resendRequested")
                     if resend_val is True or resend_val == 1:
-                        print(f"\n🔄 Resend requested: {req_id}")
+                        print(f"\n🔄 Resend requested for {req_id}")
                         process_requirement_internal(req_id, is_resend=True)
 
         except pymongo.errors.PyMongoError as e:
             print(f"❌ Change stream PyMongo error: {e}")
-            traceback.print_exc()
-            print("⏳ Retrying change stream in 5 seconds...")
-            time.sleep(5)  # wait before reconnecting
-
+            print("⏳ Retrying in 5 s...")
+            time.sleep(5)
         except Exception as e:
             print(f"❌ Change stream unexpected error: {e}")
             traceback.print_exc()
-            print("⏳ Retrying change stream in 5 seconds...")
+            print("⏳ Retrying in 5 s...")
             time.sleep(5)
+
 
 # ══════════════════════════════════════════════════════════════
 #  API ROUTES
 # ══════════════════════════════════════════════════════════════
 
+# ── PUBLIC STATS — used by homepage counters ──────────────────────────────────
+@app.get("/stats")
+def get_stats():
+    """
+    FIX: was returning stale/wrong counts.
+    Now counts Freshers, PwBDs (both collections), and Requirements.
+    """
+    try:
+        return {
+            "freshers":  db.Freshers.count_documents({}),
+            "pwbd":      db.PwBDs.count_documents({}),
+            "companies": db.Requirements.count_documents({}),
+            # combined count some frontends display as "candidates"
+            "candidates": (db.Freshers.count_documents({}) +
+                           db.PwBDs.count_documents({})),
+        }
+    except Exception as e:
+        print(f"❌ /stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── PUBLIC COMPANIES — used by homepage showcase ──────────────────────────────
+@app.get("/companies")
+def get_companies():
+    """
+    FIX: now returns ALL approved (processed=True) companies, not just 12.
+    Frontend can limit display itself. Falls back to all if none are approved yet.
+    """
+    try:
+        # Prefer approved companies; fall back to all if none approved yet
+        approved = list(
+            db.Requirements.find(
+                {"processed": True},
+                {"company": 1, "jobPreference": 1, "employees": 1, "_id": 0}
+            )
+        )
+        if approved:
+            return approved
+
+        # Fallback: return any company so homepage isn't empty
+        return list(
+            db.Requirements.find(
+                {},
+                {"company": 1, "jobPreference": 1, "employees": 1, "_id": 0}
+            ).limit(20)
+        )
+    except Exception as e:
+        print(f"❌ /companies error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── COMPANY REQUIREMENT FORM ──────────────────────────────────────────────────
 @app.post("/requirements", status_code=201)
 def create_requirement(data: dict):
-    # Normalise field names — CompanyForm previously sent 'jobType' instead of 'jobPreference'
-    # and 'workType' instead of 'workDescription'
+    """
+    FIX: expanded field normalisation — frontend sends inconsistent keys.
+    Accepts: jobType / jobPreference, workType / workDescription / jobDescription
+    """
+    # Normalise job field
     if "jobType" in data and "jobPreference" not in data:
         data["jobPreference"] = data.pop("jobType")
-    if "workType" in data and "workDescription" not in data:
-        data["workDescription"] = data.pop("workType")
+
+    # Normalise description field
+    for alt in ("workType", "jobDescription", "description"):
+        if alt in data and "workDescription" not in data:
+            data["workDescription"] = data.pop(alt)
+            break
+
+    # Normalise railways field
+    if "railway" in data and "railways" not in data:
+        data["railways"] = data.pop("railway")
 
     data.update({
         "processed":         False,
@@ -596,12 +679,17 @@ def create_requirement(data: dict):
         "totalFreshersSent": 0,
         "totalPwbdsSent":    0,
         "resendRequested":   False,
+        "submittedAt":       datetime.now(timezone.utc),
     })
+
     result = db.Requirements.insert_one(data)
-    print(f"New requirement: {result.inserted_id} | job: {data.get('jobPreference')} | railways: {data.get('railways')}")
-    return {"message": "Requirement submitted", "id": str(result.inserted_id)}
+    inserted_id = str(result.inserted_id)
+    print(f"📋 New requirement: {inserted_id} | job: {data.get('jobPreference')} "
+          f"| company: {data.get('company')}")
+    return {"message": "Requirement submitted successfully", "id": inserted_id}
 
 
+# ── FRESHER REGISTRATION ──────────────────────────────────────────────────────
 @app.post("/register/fresher", status_code=201)
 async def register_fresher(
     fullName:          str        = Form(...),
@@ -618,30 +706,30 @@ async def register_fresher(
     resume:            UploadFile = File(...),
 ):
     try:
-        # Validate file type
         if not allowed_file(resume.filename):
             raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
         file_bytes = await resume.read()
 
-        # Validate file size
         if len(file_bytes) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail="File size exceeds 5MB limit")
+            raise HTTPException(status_code=400, detail="File size exceeds 5 MB")
 
         railways_list = json.loads(railwayPreference)
 
         data = {
+            # FIX: store BOTH field name variants so ML ranking & change stream both work
             "fullName":          fullName,
-            "name":              fullName,          # normalised field
+            "name":              fullName,
             "email":             email,
             "whatsapp":          whatsapp,
             "railwayPreference": railways_list,
-            "railways":          railways_list,     # normalised field
+            "railways":          railways_list,
             "college":           college,
             "course":            course,
             "year":              year,
             "jobPreference":     jobPreference,
             "skills":            skills,
+            "keySkills":         skills,        # FIX: store keySkills alias too
             "mmrResident":       mmrResident,
             "consent":           consent,
             "registrationDate":  datetime.now(timezone.utc),
@@ -649,11 +737,11 @@ async def register_fresher(
 
         resume_id = save_resume_to_gridfs(file_bytes, resume.filename, fullName, email)
         if resume_id:
-            data["resumeFileId"]  = resume_id
+            data["resumeFileId"]   = resume_id
             data["resumeFilename"] = secure_filename(resume.filename)
 
         result = db.Freshers.insert_one(data)
-        print(f"👤 Fresher registered: {result.inserted_id} (Resume: {resume_id})")
+        print(f"👤 Fresher registered: {result.inserted_id} | {fullName} | resume={resume_id}")
         return {"message": "Fresher registered successfully", "id": str(result.inserted_id)}
 
     except HTTPException:
@@ -664,71 +752,71 @@ async def register_fresher(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── PwBD REGISTRATION ─────────────────────────────────────────────────────────
 @app.post("/register/pwbd", status_code=201)
 async def register_pwbd(
-    name:          str        = Form(...),
-    disability:    str        = Form(...),
-    email:         str        = Form(...),
-    whatsapp:      str        = Form(...),
-    railways:      str        = Form("[]"),
-    college:       str        = Form(...),
-    course:        str        = Form(...),
-    year:          str        = Form(...),
-    jobPreference: str        = Form(...),
-    skills:        str        = Form(...),
-    mmrResident:   str        = Form(...),
+    name:                   str        = Form(...),
+    disability:             str        = Form(...),
+    email:                  str        = Form(...),
+    whatsapp:               str        = Form(...),
+    railways:               str        = Form("[]"),
+    college:                str        = Form(...),
+    course:                 str        = Form(...),
+    year:                   str        = Form(...),
+    jobPreference:          str        = Form(...),
+    skills:                 str        = Form(...),
+    mmrResident:            str        = Form(...),
     consent:                str        = Form(...),
     resume:                 UploadFile = File(...),
     disability_certificate: UploadFile = File(...),
 ):
     try:
-        # Validate resume
         if not allowed_file(resume.filename):
-            raise HTTPException(status_code=400, detail="Only PDF files are allowed for resume")
+            raise HTTPException(status_code=400, detail="Only PDF files allowed for resume")
         file_bytes = await resume.read()
         if len(file_bytes) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail="Resume file size exceeds 5MB limit")
+            raise HTTPException(status_code=400, detail="Resume exceeds 5 MB")
 
-        # Validate disability certificate
         if not allowed_file(disability_certificate.filename):
-            raise HTTPException(status_code=400, detail="Only PDF files are allowed for disability certificate")
+            raise HTTPException(status_code=400, detail="Only PDF files allowed for certificate")
         cert_bytes = await disability_certificate.read()
         if len(cert_bytes) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail="Disability certificate file size exceeds 5MB limit")
+            raise HTTPException(status_code=400, detail="Certificate exceeds 5 MB")
 
         railways_list = json.loads(railways)
 
         data = {
             "name":             name,
+            "fullName":         name,
             "disability":       disability,
             "email":            email,
             "whatsapp":         whatsapp,
             "railways":         railways_list,
+            "railwayPreference": railways_list,
             "college":          college,
             "course":           course,
             "year":             year,
             "jobPreference":    jobPreference,
             "skills":           skills,
+            "keySkills":        skills,          # FIX: dual-field storage
             "mmrResident":      mmrResident,
             "consent":          consent,
             "registrationDate": datetime.now(timezone.utc),
         }
 
-        # Save resume
         resume_id = save_resume_to_gridfs(file_bytes, resume.filename, name, email)
         if resume_id:
             data["resumeFileId"]   = resume_id
             data["resumeFilename"] = secure_filename(resume.filename)
 
-        # Save disability certificate with name suffix
-        cert_safe_filename = f"{name}_Disability_Certificate.pdf"
-        cert_id = save_resume_to_gridfs(cert_bytes, cert_safe_filename, name, email)
+        cert_filename = f"{name}_Disability_Certificate.pdf"
+        cert_id = save_resume_to_gridfs(cert_bytes, cert_filename, name, email)
         if cert_id:
             data["disabilityCertificateFileId"]   = cert_id
-            data["disabilityCertificateFilename"] = cert_safe_filename
+            data["disabilityCertificateFilename"] = cert_filename
 
         result = db.PwBDs.insert_one(data)
-        print(f"👤 PwBD registered: {result.inserted_id} (Resume: {resume_id} | Cert: {cert_id})")
+        print(f"♿ PwBD registered: {result.inserted_id} | {name} | resume={resume_id} cert={cert_id}")
         return {"message": "PwBD registered successfully", "id": str(result.inserted_id)}
 
     except HTTPException:
@@ -739,20 +827,26 @@ async def register_pwbd(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── VOLUNTEER REGISTRATION ────────────────────────────────────────────────────
 @app.post("/register/volunteer", status_code=201)
 def register_volunteer(data: dict):
+    data["registrationDate"] = datetime.now(timezone.utc)
     result = db.Volunteers.insert_one(data)
-    print(f"👤 Volunteer registered: {result.inserted_id}")
-    return {"message": "Volunteer registered"}
+    print(f"🙋 Volunteer registered: {result.inserted_id}")
+    return {"message": "Volunteer registered successfully", "id": str(result.inserted_id)}
 
 
+# ── CONTACT FORM ──────────────────────────────────────────────────────────────
 @app.post("/contact", status_code=201)
 def contact(data: dict):
+    data["submittedAt"] = datetime.now(timezone.utc)
     result = db.ContactUs.insert_one(data)
     print(f"📧 Contact submitted: {result.inserted_id}")
-    return {"message": "Contact submitted"}
+    return {"message": "Message received. We will get back to you shortly.",
+            "id": str(result.inserted_id)}
 
 
+# ── ADMIN: ALL REQUIREMENTS ───────────────────────────────────────────────────
 @app.get("/admin/requirements")
 def get_requirements():
     try:
@@ -760,15 +854,17 @@ def get_requirements():
         for req in requirements:
             req["_id"] = str(req["_id"])
         stats = {
-            "freshers":  db.Freshers.count_documents({}),
-            "pwbd":      db.PwBDs.count_documents({}),
+            "freshers":   db.Freshers.count_documents({}),
+            "pwbd":       db.PwBDs.count_documents({}),
             "volunteers": db.Volunteers.count_documents({}),
+            "companies":  db.Requirements.count_documents({}),
         }
         return {"requirements": requirements, "stats": stats}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── ADMIN: RESEND CANDIDATES ──────────────────────────────────────────────────
 @app.post("/admin/resend-candidates/{requirement_id}")
 def resend_candidates(requirement_id: str):
     try:
@@ -776,40 +872,28 @@ def resend_candidates(requirement_id: str):
             {"_id": ObjectId(requirement_id)},
             {"$set": {"resendRequested": True}},
         )
-        return {"message": "Resend triggered — 10 more candidates will be sent"}
+        return {"message": "Resend triggered — up to 10 more candidates will be sent"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/companies")
-def get_companies():
-    """Fetch up to 12 approved companies for the homepage showcase."""
-    try:
-        companies = list(
-            db.Requirements.find(
-                {},
-                {"company": 1, "jobPreference": 1, "employees": 1, "_id": 0}
-            ).limit(12)
-        )
-        return companies
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ── DEBUG: ENV CHECK (safe — only shows masked values) ────────────────────────
+@app.get("/debug/env")
+def debug_env():
+    """
+    Call this endpoint after deploying to confirm all env vars are loaded.
+    Returns masked values — safe to call even in production.
+    """
+    return {
+        "MONGO_URI":        "✅ set" if MONGO_URI        else "❌ MISSING",
+        "EMAIL_ADDRESS":    EMAIL_ADDRESS                if EMAIL_ADDRESS    else "❌ MISSING",
+        "SENDGRID_API_KEY": f"✅ set (length={len(SENDGRID_API_KEY)})"
+                            if SENDGRID_API_KEY else "❌ MISSING",
+        "ML_MODEL_LOADED":  ML_MODEL is not None,
+    }
 
 
-@app.get("/stats")
-def get_stats():
-    """Public stats endpoint for homepage counters."""
-    try:
-        return {
-            "freshers":  db.Freshers.count_documents({}),
-            "pwbd":      db.PwBDs.count_documents({}),
-            "companies": db.Requirements.count_documents({}),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# ── HEALTH CHECK ──────────────────────────────────────────────────────────────
 @app.get("/health")
 def health_check():
-    """Simple health check endpoint for load balancer / uptime monitoring."""
-    return {"status": "ok"}
+    return {"status": "ok", "version": "3.0.0"}

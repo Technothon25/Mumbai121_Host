@@ -9,6 +9,5 @@ python-multipart==0.0.9
 python-dotenv==1.0.1
 werkzeug==3.0.4
 scikit-learn==1.5.1
-gridfs-support
 dnspython==2.6.1
 sendgrid==6.11.0

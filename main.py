@@ -85,8 +85,12 @@ def load_ml_model():
         X = vectorizer.fit_transform(texts).toarray()
         y = np.array(scores)
 
-        from sklearn.linear_model import Ridge
-        model = Ridge(alpha=1.0)   # Pure Python — zero OpenMP/libgomp dependency
+        from sklearn.ensemble import RandomForestRegressor
+        model = RandomForestRegressor(
+            n_estimators=100, max_depth=15,
+            min_samples_split=5, min_samples_leaf=2,
+            random_state=42, n_jobs=1
+        )
         model.fit(X, y)
 
         ML_MODEL      = model

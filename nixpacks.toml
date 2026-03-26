@@ -1,5 +1,11 @@
+[phases.setup]
+nixPkgs = ["stdenv.cc.cc.lib", "gcc"]
+
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+  "pip install -r requirements.txt --ignore-installed scikit-learn",
+  "pip install --no-binary scikit-learn scikit-learn==1.5.1"
+]
 
 [start]
 cmd = "python -m gunicorn -c gunicorn.conf.py main:app"

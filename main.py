@@ -486,29 +486,78 @@ def process_requirement_internal(requirement_id: str, is_resend: bool = False) -
 
 
 # ── CHANGE STREAM (runs in single daemon thread) ──────────────────────────────
+import time
+
+# ── CHANGE STREAM (runs in single daemon thread) ──────────────────────────────
 def watch_requirements():
+    """
+    Watches the Requirements collection for updates.
+    Automatically retries on any error so the stream never dies silently.
+    """
     print("👀 Change stream watcher started")
-    try:
-        with db.Requirements.watch(full_document="updateLookup") as stream:
-            for change in stream:
-                if change["operationType"] != "update":
-                    continue
-                req_id        = str(change["documentKey"]["_id"])
-                doc           = change.get("fullDocument", {})
-                updated_fields = change.get("updateDescription", {}).get("updatedFields", {})
+    resume_token = None  # allows resuming from where we left off after a crash
 
-                if updated_fields.get("processed") is True and not doc.get("aiProcessed", False):
-                    print(f"\n🆕 Admin approved: {req_id}")
-                    process_requirement_internal(req_id, is_resend=False)
+    while True:  # ← retry loop: stream will NEVER die permanently
+        try:
+            watch_kwargs = {"full_document": "updateLookup"}
+            if resume_token:
+                watch_kwargs["resume_after"] = resume_token
+                print("🔄 Resuming change stream from last token...")
 
-                if updated_fields.get("resendRequested") is True:
-                    print(f"\n🔄 Resend requested: {req_id}")
-                    process_requirement_internal(req_id, is_resend=True)
+            with db.Requirements.watch(**watch_kwargs) as stream:
+                print("✅ Change stream active and listening...")
+                for change in stream:
+                    # Always save the resume token so we can recover
+                    resume_token = stream.resume_token
 
-    except Exception as e:
-        print(f"❌ Change stream error: {e}")
-        traceback.print_exc()
+                    op = change["operationType"]
 
+                    # ── DEBUG: log every change so you can see what's arriving
+                    print(f"\n📡 Change detected | op={op} | "
+                          f"id={change['documentKey']['_id']}")
+
+                    if op != "update":
+                        print(f"   ⏭️  Skipping op={op} (not an update)")
+                        continue
+
+                    req_id         = str(change["documentKey"]["_id"])
+                    doc            = change.get("fullDocument") or {}
+                    updated_fields = change.get("updateDescription", {}).get("updatedFields", {})
+
+                    # ── DEBUG: show exactly what fields changed and their types
+                    print(f"   Updated fields : {list(updated_fields.keys())}")
+                    print(f"   processed value: {updated_fields.get('processed')!r}  "
+                          f"(type={type(updated_fields.get('processed')).__name__})")
+                    print(f"   aiProcessed    : {doc.get('aiProcessed')!r}")
+
+                    # ── FIX: accept both boolean True AND truthy values (1, "true", etc.)
+                    processed_val   = updated_fields.get("processed")
+                    processed_true  = processed_val is True or processed_val == 1
+                    ai_not_done     = not doc.get("aiProcessed", False)
+
+                    if processed_true and ai_not_done:
+                        print(f"\n🆕 Admin approved: {req_id} — triggering email...")
+                        process_requirement_internal(req_id, is_resend=False)
+
+                    elif processed_true and not ai_not_done:
+                        print(f"   ⚠️  processed=True but aiProcessed already done — skipping")
+
+                    resend_val = updated_fields.get("resendRequested")
+                    if resend_val is True or resend_val == 1:
+                        print(f"\n🔄 Resend requested: {req_id}")
+                        process_requirement_internal(req_id, is_resend=True)
+
+        except pymongo.errors.PyMongoError as e:
+            print(f"❌ Change stream PyMongo error: {e}")
+            traceback.print_exc()
+            print("⏳ Retrying change stream in 5 seconds...")
+            time.sleep(5)  # wait before reconnecting
+
+        except Exception as e:
+            print(f"❌ Change stream unexpected error: {e}")
+            traceback.print_exc()
+            print("⏳ Retrying change stream in 5 seconds...")
+            time.sleep(5)
 
 # ══════════════════════════════════════════════════════════════
 #  API ROUTES

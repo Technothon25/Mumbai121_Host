@@ -146,7 +146,7 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     load_ml_model()
 
-    # Reset stale lock from previous crashed container
+    # Reset stale lock from a previous crashed container
     try:
         db.WorkerLocks.update_one(
             {"key": WORKER_LOCK_KEY},
@@ -760,7 +760,7 @@ def get_companies():
                 {"company": 1, "jobPreference": 1, "employees": 1, "_id": 0}
             ).limit(12)
         )
-        return companies
+        return JSONResponse(content=companies, headers={"Cache-Control": "no-store"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -769,11 +769,12 @@ def get_companies():
 def get_stats():
     """Public stats endpoint for homepage counters."""
     try:
-        return {
+        data = {
             "freshers":  db.Freshers.count_documents({}),
             "pwbd":      db.PwBDs.count_documents({}),
             "companies": db.Requirements.count_documents({}),
         }
+        return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

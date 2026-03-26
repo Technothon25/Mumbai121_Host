@@ -150,6 +150,19 @@ def release_worker_lock():
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     load_ml_model()
+
+    # Always reset the lock on startup — previous container may have died
+    # without releasing it, leaving it permanently locked
+    try:
+        db.WorkerLocks.update_one(
+            {"key": WORKER_LOCK_KEY},
+            {"$set": {"locked": False}},
+            upsert=True,
+        )
+        print("🔓 Worker lock reset on startup")
+    except Exception:
+        pass
+
     # Start change stream watcher in exactly one worker
     if try_acquire_worker_lock():
         print("🔑 This worker acquired the change stream lock")

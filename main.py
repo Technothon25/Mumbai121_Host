@@ -3,19 +3,17 @@
 #  Stack: FastAPI + PyMongo (sync) + Gunicorn + Uvicorn workers
 # ============================================================
 
-import base64
 import json
-import time
+import pickle
+import smtplib
 import threading
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import (
-    Mail, Attachment, FileContent, FileName,
-    FileType, Disposition, To
-)
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import gridfs
 import pymongo
@@ -30,13 +28,14 @@ import os
 # ── ENV ───────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-MONGO_URI        = os.getenv("MONGO_URI")
-EMAIL_ADDRESS    = os.getenv("EMAIL_ADDRESS")
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+MONGO_URI      = os.getenv("MONGO_URI")
+EMAIL_ADDRESS  = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
 # ── MONGODB ───────────────────────────────────────────────────────────────────
 client = pymongo.MongoClient(
     MONGO_URI,
+    # Connection pool tuned for 4 Gunicorn workers
     maxPoolSize=25,
     minPoolSize=5,
     serverSelectionTimeoutMS=5000,
@@ -52,84 +51,25 @@ MAX_FILE_SIZE      = 5 * 1024 * 1024  # 5 MB
 ML_MODEL      = None
 ML_VECTORIZER = None
 
-def get_candidate_skills(candidate: dict) -> str:
-    """
-    BUG FIX: Skills are stored under different field names depending on how the
-    candidate registered.  Always check all variants so ML ranking and fallback
-    ranking work correctly instead of silently receiving empty strings.
-    """
-    return (
-        candidate.get("keySkills") or
-        candidate.get("skills") or
-        candidate.get("skill") or
-        candidate.get("Skills") or
-        ""
-    )
-
 def load_ml_model():
-    """
-    Train a fresh model from the JSON training data at startup.
-    BUG FIX: Check BOTH possible training-data filenames so startup
-    training works whether you ran generate_training_data.py or
-    extract_real_training_data.py.
-    """
     global ML_MODEL, ML_VECTORIZER
-
-    # BUG FIX: generate_training_data.py saves to 'mumbai121_training_data.json'
-    # (no _real suffix), but load_ml_model previously only looked for the _real
-    # variant.  Check both.
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(base_dir, "mumbai121_training_data_real.json"),
-        os.path.join(base_dir, "mumbai121_training_data.json"),
-    ]
-    training_file = next((p for p in candidates if os.path.exists(p)), None)
-
-    if not training_file:
-        print("⚠️  No training data file found — using fallback TF-IDF ranking")
-        print(f"   Looked for: {[os.path.basename(p) for p in candidates]}")
-        return False
-
-    try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.ensemble import RandomForestRegressor
-        import numpy as np
-
-        with open(training_file, "r", encoding="utf-8") as f:
-            training_data = json.load(f)
-
-        if len(training_data) < 10:
-            print(f"⚠️  Only {len(training_data)} training examples — need at least 10. Using fallback.")
+    model_path = "mumbai121_candidate_ranker.pkl"
+    if os.path.exists(model_path):
+        try:
+            with open(model_path, "rb") as f:
+                model_data = pickle.load(f)
+            ML_MODEL      = model_data["model"]
+            ML_VECTORIZER = model_data["vectorizer"]
+            print("✅ ML model loaded successfully!")
+            print(f"   Training size : {model_data.get('training_size', 'Unknown')}")
+            print(f"   Test R² Score : {model_data.get('test_r2', 0):.3f}")
+            print(f"   Features      : {model_data.get('feature_count', 0)}")
+            return True
+        except Exception as e:
+            print(f"⚠️  Error loading ML model: {e} — using fallback ranking")
             return False
-
-        print(f"🎓 Training ML model on {len(training_data)} examples from {os.path.basename(training_file)} …")
-
-        texts  = [d["job_description"] + " " + d["candidate_skills"] for d in training_data]
-        scores = [d["relevance_score"] for d in training_data]
-
-        vectorizer = TfidfVectorizer(max_features=200, ngram_range=(1, 2),
-                                     min_df=2, max_df=0.8)
-        X = vectorizer.fit_transform(texts).toarray()
-        y = np.array(scores)
-
-        model = RandomForestRegressor(
-            n_estimators=100, max_depth=15,
-            min_samples_split=5, min_samples_leaf=2,
-            random_state=42,
-            n_jobs=1   # keep deterministic; avoids libgomp issues on Railway
-        )
-        model.fit(X, y)
-
-        ML_MODEL      = model
-        ML_VECTORIZER = vectorizer
-        print(f"✅ ML model trained successfully on {len(training_data)} examples!")
-        return True
-
-    except Exception as e:
-        print(f"⚠️  Error training ML model: {e} — using fallback TF-IDF ranking")
-        traceback.print_exc()
-        return False
-
+    print("⚠️  ML model file not found — using fallback ranking")
+    return False
 
 # ── SKILL KEYWORDS ────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -139,21 +79,30 @@ with open(SKILL_FILE, "r", encoding="utf-8") as f:
     SKILL_KEYWORDS = json.load(f)
 
 # ── LIFESPAN (startup / shutdown) ─────────────────────────────────────────────
+# The change stream runs in ONE dedicated daemon thread.
+# Gunicorn spawns multiple worker PROCESSES — to avoid duplicate emails,
+# only the *first* worker that acquires the lock starts the watcher.
+# The lock is stored in MongoDB so it works across processes.
+
 WORKER_LOCK_KEY = "change_stream_lock"
 
 def try_acquire_worker_lock() -> bool:
-    """Only one Gunicorn worker should run the change stream."""
+    """Only one Gunicorn worker should run the change stream.
+    Uses a single atomic upsert — only the first worker wins."""
     try:
+        # First ensure the lock document exists with locked=False
         db.WorkerLocks.update_one(
             {"key": WORKER_LOCK_KEY},
             {"$setOnInsert": {"key": WORKER_LOCK_KEY, "locked": False}},
             upsert=True,
         )
+        # Now atomically try to acquire it — only succeeds if locked=False
         result = db.WorkerLocks.find_one_and_update(
             {"key": WORKER_LOCK_KEY, "locked": False},
             {"$set": {"locked": True, "acquired_at": datetime.now(timezone.utc)}},
             upsert=False,
         )
+        # result is the OLD document (before update) — not None means we won
         return result is not None
     except Exception:
         return False
@@ -171,18 +120,7 @@ def release_worker_lock():
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     load_ml_model()
-
-    # Reset the lock on startup — previous container may have died holding it
-    try:
-        db.WorkerLocks.update_one(
-            {"key": WORKER_LOCK_KEY},
-            {"$set": {"locked": False}},
-            upsert=True,
-        )
-        print("🔓 Worker lock reset on startup")
-    except Exception:
-        pass
-
+    # Start change stream watcher in exactly one worker
     if try_acquire_worker_lock():
         print("🔑 This worker acquired the change stream lock")
         t = threading.Thread(target=watch_requirements, daemon=True)
@@ -196,6 +134,7 @@ async def lifespan(app: FastAPI):
 
     yield  # Application runs here
 
+    # Shutdown
     release_worker_lock()
     print("🛑 Server shutting down — lock released")
 
@@ -220,7 +159,7 @@ app.add_middleware(
 )
 
 # ══════════════════════════════════════════════════════════════
-#  HELPER FUNCTIONS
+#  HELPER FUNCTIONS  (identical logic to Flask version)
 # ══════════════════════════════════════════════════════════════
 
 def allowed_file(filename: str) -> bool:
@@ -287,9 +226,10 @@ def match_railway_lines(company_railways, candidate_railways) -> bool:
 def get_matching_candidates(company_job: str, company_railways: list,
                              collection) -> list:
     matches = []
-    for candidate in collection.find({"jobPreference": company_job}):  # use index filter
+    for candidate in collection.find():
         nc = normalize_candidate_data(candidate)
-        if match_railway_lines(company_railways, nc.get("railways", [])):
+        if nc.get("jobPreference") == company_job and \
+                match_railway_lines(company_railways, nc.get("railways", [])):
             matches.append(nc)
     return matches
 
@@ -300,13 +240,11 @@ def rank_candidates_with_ml(work_description: str, candidates: list,
         return []
     print(f"🤖 Ranking {len(candidates)} {candidate_type} candidates...")
 
-    # BUG FIX: previously used only c.get('skills','') which is empty for many
-    # candidates whose skills are stored as 'keySkills'.  Now uses get_candidate_skills()
-    # which checks all field name variants.
+    # Try custom ML model
     if ML_MODEL and ML_VECTORIZER:
         try:
             features = [
-                f"{work_description} {get_candidate_skills(c)} "
+                f"{work_description} {c.get('skills','')} "
                 f"{c.get('course','')} {c.get('college','')}"
                 for c in candidates
             ]
@@ -325,9 +263,8 @@ def rank_candidates_with_ml(work_description: str, candidates: list,
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.metrics.pairwise import cosine_similarity
 
-        # BUG FIX: same fix applied to the fallback path
         texts = [work_description] + [
-            f"{get_candidate_skills(c)} {c.get('course','')} {c.get('college','')}"
+            f"{c.get('skills','')} {c.get('course','')} {c.get('college','')}"
             for c in candidates
         ]
         vectorizer   = TfidfVectorizer(stop_words="english")
@@ -359,15 +296,14 @@ def generate_html_table(candidates: list, candidate_type: str) -> str:
     html += "</tr>"
 
     for i, c in enumerate(candidates, 1):
-        bg     = "#f9f9f9" if i % 2 == 0 else "white"
-        name   = c.get("name") or c.get("fullName", "N/A")
-        skills = get_candidate_skills(c) or "N/A"   # BUG FIX: use normalised getter
+        bg    = "#f9f9f9" if i % 2 == 0 else "white"
+        name  = c.get("name") or c.get("fullName", "N/A")
         html += f"""
         <tr style="background:{bg}">
             <td>{i}</td><td>{name}</td>
             <td>{c.get('email','N/A')}</td><td>{c.get('whatsapp','N/A')}</td>
             <td>{c.get('college','N/A')}</td><td>{c.get('course','N/A')}</td>
-            <td>{skills}</td>
+            <td>{c.get('skills','N/A')}</td>
         """
         if candidate_type == "pwbd":
             html += f"<td>{c.get('disability','N/A')}</td>"
@@ -379,6 +315,11 @@ def generate_html_table(candidates: list, candidate_type: str) -> str:
 
 def send_email_with_resumes(to_email: str, company_name: str,
                              fresher_candidates: list, pwbd_candidates: list) -> bool:
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = f"Matched Candidates for {company_name}"
+    msg["From"]    = EMAIL_ADDRESS
+    msg["To"]      = to_email
+
     body = f"""
     <html><body>
         <p>Hello {company_name},</p>
@@ -392,15 +333,13 @@ def send_email_with_resumes(to_email: str, company_name: str,
         <p>Best Regards,<br>The Mumbai121 Team</p>
     </body></html>
     """
+    msg_body = MIMEMultipart("alternative")
+    msg_body.attach(MIMEText(body, "html"))
+    msg.attach(msg_body)
 
-    message = Mail(
-        from_email=EMAIL_ADDRESS,
-        to_emails=to_email,
-        subject=f"Matched Candidates for {company_name}",
-        html_content=body,
-    )
-
-    for label, candidates in [("Fresher", fresher_candidates), ("PwBD", pwbd_candidates)]:
+    # Attach resumes
+    for label, candidates in [("Fresher", fresher_candidates),
+                               ("PwBD",   pwbd_candidates)]:
         for i, c in enumerate(candidates, 1):
             resume_id = c.get("resumeFileId")
             if not resume_id:
@@ -408,24 +347,23 @@ def send_email_with_resumes(to_email: str, company_name: str,
             try:
                 resume_file = get_resume_from_gridfs(resume_id)
                 if resume_file:
-                    name      = c.get("name") or c.get("fullName", f"{label}_{i}")
+                    name     = c.get("name") or c.get("fullName", f"{label}_{i}")
+                    part     = MIMEBase("application", "pdf")
+                    part.set_payload(resume_file.read())
+                    encoders.encode_base64(part)
                     safe_name = secure_filename(name)
-                    file_data = base64.b64encode(resume_file.read()).decode()
-                    attachment = Attachment(
-                        FileContent(file_data),
-                        FileName(f"{safe_name}_{label}_Resume.pdf"),
-                        FileType("application/pdf"),
-                        Disposition("attachment"),
-                    )
-                    message.add_attachment(attachment)
+                    part.add_header("Content-Disposition",
+                                    f'attachment; filename="{safe_name}_{label}_Resume.pdf"')
+                    msg.attach(part)
                     print(f"✅ Attached resume for {name}")
             except Exception as e:
                 print(f"⚠️  Could not attach resume for {label} {i}: {e}")
 
     try:
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        response = sg.send(message)
-        print(f"✅ Email sent to {to_email} (status {response.status_code}) — "
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.send_message(msg)
+        print(f"✅ Email sent to {to_email} — "
               f"{len(fresher_candidates)} freshers, {len(pwbd_candidates)} PwBDs")
         return True
     except Exception as e:
@@ -436,6 +374,10 @@ def send_email_with_resumes(to_email: str, company_name: str,
 
 def send_no_candidates_email(to_email: str, company_name: str) -> bool:
     try:
+        msg = MIMEMultipart()
+        msg["Subject"] = f"No Additional Candidates Available — {company_name}"
+        msg["From"]    = EMAIL_ADDRESS
+        msg["To"]      = to_email
         body = f"""
         <html><body>
             <h2>Hello {company_name},</h2>
@@ -447,15 +389,10 @@ def send_no_candidates_email(to_email: str, company_name: str) -> bool:
             <p>Best regards,<br>The Mumbai121 Team</p>
         </body></html>
         """
-        message = Mail(
-            from_email=EMAIL_ADDRESS,
-            to_emails=to_email,
-            subject=f"No Additional Candidates Available — {company_name}",
-            html_content=body,
-        )
-        sg = SendGridAPIClient(SENDGRID_API_KEY)
-        response = sg.send(message)
-        print(f"✅ No-candidates email sent (status {response.status_code})")
+        msg.attach(MIMEText(body, "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.send_message(msg)
         return True
     except Exception as e:
         print(f"❌ No-candidates email error: {e}")
@@ -550,47 +487,27 @@ def process_requirement_internal(requirement_id: str, is_resend: bool = False) -
 
 # ── CHANGE STREAM (runs in single daemon thread) ──────────────────────────────
 def watch_requirements():
-    """
-    BUG FIX: The original watcher had no reconnect loop.  If the change stream
-    drops (MongoDB Atlas idle timeout, network blip, Railway restart), the thread
-    would die silently and NO future requirement approvals would trigger emails.
-
-    This version retries forever with exponential back-off (max 60 s between
-    retries) so the watcher always comes back up automatically.
-    """
     print("👀 Change stream watcher started")
-    retry_delay = 5  # seconds
+    try:
+        with db.Requirements.watch(full_document="updateLookup") as stream:
+            for change in stream:
+                if change["operationType"] != "update":
+                    continue
+                req_id        = str(change["documentKey"]["_id"])
+                doc           = change.get("fullDocument", {})
+                updated_fields = change.get("updateDescription", {}).get("updatedFields", {})
 
-    while True:
-        try:
-            with db.Requirements.watch(
-                full_document="updateLookup",
-                max_await_time_ms=10_000,   # heartbeat every 10 s so thread stays alive
-            ) as stream:
-                retry_delay = 5  # reset back-off on successful connect
-                print("✅ Change stream connected")
+                if updated_fields.get("processed") is True and not doc.get("aiProcessed", False):
+                    print(f"\n🆕 Admin approved: {req_id}")
+                    process_requirement_internal(req_id, is_resend=False)
 
-                for change in stream:
-                    if change["operationType"] != "update":
-                        continue
+                if updated_fields.get("resendRequested") is True:
+                    print(f"\n🔄 Resend requested: {req_id}")
+                    process_requirement_internal(req_id, is_resend=True)
 
-                    req_id         = str(change["documentKey"]["_id"])
-                    doc            = change.get("fullDocument", {})
-                    updated_fields = change.get("updateDescription", {}).get("updatedFields", {})
-
-                    if updated_fields.get("processed") is True and not doc.get("aiProcessed", False):
-                        print(f"\n🆕 Admin approved: {req_id}")
-                        process_requirement_internal(req_id, is_resend=False)
-
-                    if updated_fields.get("resendRequested") is True:
-                        print(f"\n🔄 Resend requested: {req_id}")
-                        process_requirement_internal(req_id, is_resend=True)
-
-        except Exception as e:
-            print(f"❌ Change stream error: {e} — retrying in {retry_delay}s …")
-            traceback.print_exc()
-            time.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 60)  # exponential back-off, cap at 60 s
+    except Exception as e:
+        print(f"❌ Change stream error: {e}")
+        traceback.print_exc()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -599,6 +516,8 @@ def watch_requirements():
 
 @app.post("/requirements", status_code=201)
 def create_requirement(data: dict):
+    # Normalise field names — CompanyForm previously sent 'jobType' instead of 'jobPreference'
+    # and 'workType' instead of 'workDescription'
     if "jobType" in data and "jobPreference" not in data:
         data["jobPreference"] = data.pop("jobType")
     if "workType" in data and "workDescription" not in data:
@@ -637,11 +556,13 @@ async def register_fresher(
     resume:            UploadFile = File(...),
 ):
     try:
+        # Validate file type
         if not allowed_file(resume.filename):
             raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
         file_bytes = await resume.read()
 
+        # Validate file size
         if len(file_bytes) > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail="File size exceeds 5MB limit")
 
@@ -649,11 +570,11 @@ async def register_fresher(
 
         data = {
             "fullName":          fullName,
-            "name":              fullName,
+            "name":              fullName,          # normalised field
             "email":             email,
             "whatsapp":          whatsapp,
             "railwayPreference": railways_list,
-            "railways":          railways_list,
+            "railways":          railways_list,     # normalised field
             "college":           college,
             "course":            course,
             "year":              year,
@@ -699,12 +620,14 @@ async def register_pwbd(
     disability_certificate: UploadFile = File(...),
 ):
     try:
+        # Validate resume
         if not allowed_file(resume.filename):
             raise HTTPException(status_code=400, detail="Only PDF files are allowed for resume")
         file_bytes = await resume.read()
         if len(file_bytes) > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail="Resume file size exceeds 5MB limit")
 
+        # Validate disability certificate
         if not allowed_file(disability_certificate.filename):
             raise HTTPException(status_code=400, detail="Only PDF files are allowed for disability certificate")
         cert_bytes = await disability_certificate.read()
@@ -729,11 +652,13 @@ async def register_pwbd(
             "registrationDate": datetime.now(timezone.utc),
         }
 
+        # Save resume
         resume_id = save_resume_to_gridfs(file_bytes, resume.filename, name, email)
         if resume_id:
             data["resumeFileId"]   = resume_id
             data["resumeFilename"] = secure_filename(resume.filename)
 
+        # Save disability certificate with name suffix
         cert_safe_filename = f"{name}_Disability_Certificate.pdf"
         cert_id = save_resume_to_gridfs(cert_bytes, cert_safe_filename, name, email)
         if cert_id:
@@ -773,8 +698,8 @@ def get_requirements():
         for req in requirements:
             req["_id"] = str(req["_id"])
         stats = {
-            "freshers":   db.Freshers.count_documents({}),
-            "pwbd":       db.PwBDs.count_documents({}),
+            "freshers":  db.Freshers.count_documents({}),
+            "pwbd":      db.PwBDs.count_documents({}),
             "volunteers": db.Volunteers.count_documents({}),
         }
         return {"requirements": requirements, "stats": stats}

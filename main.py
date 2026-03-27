@@ -6,15 +6,15 @@
 import base64
 import json
 import pickle
-import smtplib
 import threading
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from email import encoders
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import (
+    Attachment, Disposition, FileContent, FileName, FileType, Mail,
+)
 
 import gridfs
 import pymongo
@@ -29,14 +29,9 @@ import os
 # ── ENV ───────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-MONGO_URI      = os.getenv("MONGO_URI")
-EMAIL_ADDRESS  = os.getenv("EMAIL_ADDRESS")   # e.g. onboarding@resend.dev
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")  # Resend API key used as SMTP password
-
-# Resend SMTP — not blocked by Railway unlike Gmail
-SMTP_HOST = "smtp.resend.com"
-SMTP_PORT = 465
-SMTP_USER = "resend"
+MONGO_URI        = os.getenv("MONGO_URI")
+EMAIL_ADDRESS    = os.getenv("EMAIL_ADDRESS")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 
 # ── MONGODB ───────────────────────────────────────────────────────────────────
 client = pymongo.MongoClient(
@@ -87,7 +82,7 @@ def load_ml_model():
         model = RandomForestRegressor(
             n_estimators=100, max_depth=15,
             min_samples_split=5, min_samples_leaf=2,
-            random_state=42, n_jobs=1
+            random_state=42, n_jobs=1   # n_jobs=1 = no OpenMP
         )
         model.fit(X, y)
 
@@ -355,11 +350,6 @@ def generate_html_table(candidates: list, candidate_type: str) -> str:
 
 def send_email_with_resumes(to_email: str, company_name: str,
                              fresher_candidates: list, pwbd_candidates: list) -> bool:
-    msg = MIMEMultipart("mixed")
-    msg["Subject"] = f"Matched Candidates for {company_name}"
-    msg["From"]    = EMAIL_ADDRESS
-    msg["To"]      = to_email
-
     body = f"""
     <html><body>
         <p>Hello {company_name},</p>
@@ -373,8 +363,12 @@ def send_email_with_resumes(to_email: str, company_name: str,
         <p>Best Regards,<br>The Mumbai121 Team</p>
     </body></html>
     """
-    msg.attach(MIMEText(body, "html"))
-
+    message = Mail(
+        from_email=EMAIL_ADDRESS,
+        to_emails=to_email,
+        subject=f"Matched Candidates for {company_name}",
+        html_content=body,
+    )
     for label, candidates in [("Fresher", fresher_candidates), ("PwBD", pwbd_candidates)]:
         for i, c in enumerate(candidates, 1):
             resume_id = c.get("resumeFileId")
@@ -385,22 +379,21 @@ def send_email_with_resumes(to_email: str, company_name: str,
                 if resume_file:
                     name      = c.get("name") or c.get("fullName", f"{label}_{i}")
                     safe_name = secure_filename(name)
-                    part      = MIMEBase("application", "pdf")
-                    part.set_payload(resume_file.read())
-                    encoders.encode_base64(part)
-                    part.add_header("Content-Disposition",
-                                    f'attachment; filename="{safe_name}_{label}_Resume.pdf"')
-                    msg.attach(part)
+                    file_data = base64.b64encode(resume_file.read()).decode()
+                    attachment = Attachment(
+                        FileContent(file_data),
+                        FileName(f"{safe_name}_{label}_Resume.pdf"),
+                        FileType("application/pdf"),
+                        Disposition("attachment"),
+                    )
+                    message.add_attachment(attachment)
                     print(f"✅ Attached resume for {name}")
             except Exception as e:
                 print(f"⚠️  Could not attach resume for {label} {i}: {e}")
-
     try:
-        print(f"📧 Connecting to {SMTP_HOST}:{SMTP_PORT}...")
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
-            server.login(SMTP_USER, RESEND_API_KEY)
-            server.send_message(msg)
-        print(f"✅ Email sent to {to_email} — "
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"✅ Email sent to {to_email} (status {response.status_code}) — "
               f"{len(fresher_candidates)} freshers, {len(pwbd_candidates)} PwBDs")
         return True
     except Exception as e:
@@ -411,10 +404,6 @@ def send_email_with_resumes(to_email: str, company_name: str,
 
 def send_no_candidates_email(to_email: str, company_name: str) -> bool:
     try:
-        msg = MIMEMultipart()
-        msg["Subject"] = f"No Additional Candidates Available — {company_name}"
-        msg["From"]    = EMAIL_ADDRESS
-        msg["To"]      = to_email
         body = f"""
         <html><body>
             <h2>Hello {company_name},</h2>
@@ -426,15 +415,18 @@ def send_no_candidates_email(to_email: str, company_name: str) -> bool:
             <p>Best regards,<br>The Mumbai121 Team</p>
         </body></html>
         """
-        msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
-            server.login(SMTP_USER, RESEND_API_KEY)
-            server.send_message(msg)
-        print(f"✅ No-candidates email sent")
+        message = Mail(
+            from_email=EMAIL_ADDRESS,
+            to_emails=to_email,
+            subject=f"No Additional Candidates Available — {company_name}",
+            html_content=body,
+        )
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"✅ No-candidates email sent (status {response.status_code})")
         return True
     except Exception as e:
         print(f"❌ No-candidates email error: {e}")
-        traceback.print_exc()
         return False
 
 

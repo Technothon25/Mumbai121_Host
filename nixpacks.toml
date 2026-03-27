@@ -2,4 +2,4 @@
 cmds = ["pip install --no-cache-dir -r requirements.txt"]
 
 [start]
-cmd = "python -m gunicorn -c gunicorn.conf.py main:app"
+cmd = "python -m gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-8000} --timeout 120 main:app"

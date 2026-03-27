@@ -29,11 +29,11 @@ import os
 # ── ENV ───────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-MONGO_URI       = os.getenv("MONGO_URI")
-EMAIL_ADDRESS   = os.getenv("EMAIL_ADDRESS")   # e.g. onboarding@resend.dev
-RESEND_API_KEY  = os.getenv("RESEND_API_KEY")  # used as SMTP password
+MONGO_URI      = os.getenv("MONGO_URI")
+EMAIL_ADDRESS  = os.getenv("EMAIL_ADDRESS")   # e.g. onboarding@resend.dev
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")  # Resend API key used as SMTP password
 
-# ── SMTP CONFIG (Resend SMTP — works on Railway) ──────────────
+# Resend SMTP — not blocked by Railway unlike Gmail
 SMTP_HOST = "smtp.resend.com"
 SMTP_PORT = 465
 SMTP_USER = "resend"
@@ -383,9 +383,9 @@ def send_email_with_resumes(to_email: str, company_name: str,
             try:
                 resume_file = get_resume_from_gridfs(resume_id)
                 if resume_file:
-                    name     = c.get("name") or c.get("fullName", f"{label}_{i}")
+                    name      = c.get("name") or c.get("fullName", f"{label}_{i}")
                     safe_name = secure_filename(name)
-                    part = MIMEBase("application", "pdf")
+                    part      = MIMEBase("application", "pdf")
                     part.set_payload(resume_file.read())
                     encoders.encode_base64(part)
                     part.add_header("Content-Disposition",
@@ -396,6 +396,7 @@ def send_email_with_resumes(to_email: str, company_name: str,
                 print(f"⚠️  Could not attach resume for {label} {i}: {e}")
 
     try:
+        print(f"📧 Connecting to {SMTP_HOST}:{SMTP_PORT}...")
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
             server.login(SMTP_USER, RESEND_API_KEY)
             server.send_message(msg)
@@ -433,6 +434,7 @@ def send_no_candidates_email(to_email: str, company_name: str) -> bool:
         return True
     except Exception as e:
         print(f"❌ No-candidates email error: {e}")
+        traceback.print_exc()
         return False
 
 

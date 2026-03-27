@@ -4,16 +4,15 @@
 # ============================================================
 
 import os
+import multiprocessing
 
 # ── WORKER CONFIG ─────────────────────────────────────────────
 worker_class = "uvicorn.workers.UvicornWorker"
-
-# Using 1 worker to prevent duplicate change stream processing
-# and duplicate email sending across multiple workers
-workers = 1
+workers = 4
 threads = 2
 
 # ── NETWORK ───────────────────────────────────────────────────
+# Railway injects PORT env variable — must bind to 0.0.0.0
 port = os.environ.get("PORT", "8000")
 bind = f"0.0.0.0:{port}"
 
@@ -22,10 +21,11 @@ timeout          = 120
 keepalive        = 5
 graceful_timeout = 30
 
-# ── LOGGING ───────────────────────────────────────────────────
+# ── LOGGING — stdout/stderr for cloud hosting ─────────────────
+# Railway captures stdout/stderr automatically — no log files needed
 loglevel  = "info"
-accesslog = "-"
-errorlog  = "-"
+accesslog = "-"   # stdout
+errorlog  = "-"   # stderr
 access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s %(D)sµs'
 
 # ── PROCESS NAMING ────────────────────────────────────────────

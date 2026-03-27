@@ -146,22 +146,10 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     load_ml_model()
 
-    # Reset stale lock from a previous crashed container
-    try:
-        db.WorkerLocks.update_one(
-            {"key": WORKER_LOCK_KEY},
-            {"$set": {"locked": False}},
-            upsert=True,
-        )
-    except Exception:
-        pass
-
-    if try_acquire_worker_lock():
-        print("🔑 This worker acquired the change stream lock")
-        t = threading.Thread(target=watch_requirements, daemon=True)
-        t.start()
-    else:
-        print("ℹ️  Another worker is handling the change stream")
+    # With 1 worker, always start the change stream watcher
+    print("🔑 Starting change stream watcher")
+    t = threading.Thread(target=watch_requirements, daemon=True)
+    t.start()
 
     print("=" * 60)
     print("🚀 Mumbai121 FastAPI server started")
@@ -169,9 +157,7 @@ async def lifespan(app: FastAPI):
 
     yield  # Application runs here
 
-    # Shutdown
-    release_worker_lock()
-    print("🛑 Server shutting down — lock released")
+    print("🛑 Server shutting down")
 
 # ── APP ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -519,26 +505,29 @@ def process_requirement_internal(requirement_id: str, is_resend: bool = False) -
 # ── CHANGE STREAM (runs in single daemon thread) ──────────────────────────────
 def watch_requirements():
     print("👀 Change stream watcher started")
-    try:
-        with db.Requirements.watch(full_document="updateLookup") as stream:
-            for change in stream:
-                if change["operationType"] != "update":
-                    continue
-                req_id        = str(change["documentKey"]["_id"])
-                doc           = change.get("fullDocument", {})
-                updated_fields = change.get("updateDescription", {}).get("updatedFields", {})
+    while True:
+        try:
+            with db.Requirements.watch(full_document="updateLookup") as stream:
+                for change in stream:
+                    if change["operationType"] != "update":
+                        continue
+                    req_id         = str(change["documentKey"]["_id"])
+                    doc            = change.get("fullDocument", {})
+                    updated_fields = change.get("updateDescription", {}).get("updatedFields", {})
 
-                if updated_fields.get("processed") is True and not doc.get("aiProcessed", False):
-                    print(f"\n🆕 Admin approved: {req_id}")
-                    process_requirement_internal(req_id, is_resend=False)
+                    if updated_fields.get("processed") is True and not doc.get("aiProcessed", False):
+                        print(f"\n🆕 Admin approved: {req_id}")
+                        process_requirement_internal(req_id, is_resend=False)
 
-                if updated_fields.get("resendRequested") is True:
-                    print(f"\n🔄 Resend requested: {req_id}")
-                    process_requirement_internal(req_id, is_resend=True)
+                    if updated_fields.get("resendRequested") is True:
+                        print(f"\n🔄 Resend requested: {req_id}")
+                        process_requirement_internal(req_id, is_resend=True)
 
-    except Exception as e:
-        print(f"❌ Change stream error: {e}")
-        traceback.print_exc()
+        except Exception as e:
+            print(f"❌ Change stream error: {e} — restarting in 5s")
+            traceback.print_exc()
+            import time
+            time.sleep(5)
 
 
 # ══════════════════════════════════════════════════════════════

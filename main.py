@@ -3,17 +3,18 @@
 #  Stack: FastAPI + PyMongo (sync) + Gunicorn + Uvicorn workers
 # ============================================================
 
+import base64
 import json
 import pickle
-import smtplib
 import threading
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from email import encoders
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import (
+    Attachment, Disposition, FileContent, FileName, FileType, Mail,
+)
 
 import gridfs
 import pymongo
@@ -28,9 +29,9 @@ import os
 # ── ENV ───────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-MONGO_URI      = os.getenv("MONGO_URI")
-EMAIL_ADDRESS  = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+MONGO_URI        = os.getenv("MONGO_URI")
+EMAIL_ADDRESS    = os.getenv("EMAIL_ADDRESS")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 
 # ── MONGODB ───────────────────────────────────────────────────────────────────
 client = pymongo.MongoClient(
@@ -53,23 +54,45 @@ ML_VECTORIZER = None
 
 def load_ml_model():
     global ML_MODEL, ML_VECTORIZER
-    model_path = "mumbai121_candidate_ranker.pkl"
-    if os.path.exists(model_path):
-        try:
-            with open(model_path, "rb") as f:
-                model_data = pickle.load(f)
-            ML_MODEL      = model_data["model"]
-            ML_VECTORIZER = model_data["vectorizer"]
-            print("✅ ML model loaded successfully!")
-            print(f"   Training size : {model_data.get('training_size', 'Unknown')}")
-            print(f"   Test R² Score : {model_data.get('test_r2', 0):.3f}")
-            print(f"   Features      : {model_data.get('feature_count', 0)}")
-            return True
-        except Exception as e:
-            print(f"⚠️  Error loading ML model: {e} — using fallback ranking")
+    training_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "mumbai121_training_data_real.json")
+    if not os.path.exists(training_file):
+        print("⚠️  Training data not found — using fallback ranking")
+        return False
+    try:
+        import numpy as np
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        with open(training_file, "r", encoding="utf-8") as f:
+            training_data = json.load(f)
+
+        if len(training_data) < 10:
+            print("⚠️  Not enough training data — using fallback ranking")
             return False
-    print("⚠️  ML model file not found — using fallback ranking")
-    return False
+
+        texts  = [d["job_description"] + " " + d["candidate_skills"] for d in training_data]
+        scores = [d["relevance_score"] for d in training_data]
+
+        vectorizer = TfidfVectorizer(max_features=200, ngram_range=(1, 2),
+                                     min_df=2, max_df=0.8)
+        X = vectorizer.fit_transform(texts).toarray()
+        y = np.array(scores)
+
+        model = RandomForestRegressor(
+            n_estimators=100, max_depth=15,
+            min_samples_split=5, min_samples_leaf=2,
+            random_state=42, n_jobs=1   # n_jobs=1 = no OpenMP
+        )
+        model.fit(X, y)
+
+        ML_MODEL      = model
+        ML_VECTORIZER = vectorizer
+        print(f"✅ ML model trained on {len(training_data)} examples!")
+        return True
+    except Exception as e:
+        print(f"⚠️  Error training ML model: {e} — using fallback ranking")
+        return False
 
 # ── SKILL KEYWORDS ────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -122,7 +145,17 @@ def release_worker_lock():
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     load_ml_model()
-    # Start change stream watcher in exactly one worker
+
+    # Reset stale lock from a previous crashed container
+    try:
+        db.WorkerLocks.update_one(
+            {"key": WORKER_LOCK_KEY},
+            {"$set": {"locked": False}},
+            upsert=True,
+        )
+    except Exception:
+        pass
+
     if try_acquire_worker_lock():
         print("🔑 This worker acquired the change stream lock")
         t = threading.Thread(target=watch_requirements, daemon=True)
@@ -317,11 +350,6 @@ def generate_html_table(candidates: list, candidate_type: str) -> str:
 
 def send_email_with_resumes(to_email: str, company_name: str,
                              fresher_candidates: list, pwbd_candidates: list) -> bool:
-    msg = MIMEMultipart("mixed")
-    msg["Subject"] = f"Matched Candidates for {company_name}"
-    msg["From"]    = EMAIL_ADDRESS
-    msg["To"]      = to_email
-
     body = f"""
     <html><body>
         <p>Hello {company_name},</p>
@@ -335,13 +363,13 @@ def send_email_with_resumes(to_email: str, company_name: str,
         <p>Best Regards,<br>The Mumbai121 Team</p>
     </body></html>
     """
-    msg_body = MIMEMultipart("alternative")
-    msg_body.attach(MIMEText(body, "html"))
-    msg.attach(msg_body)
-
-    # Attach resumes
-    for label, candidates in [("Fresher", fresher_candidates),
-                               ("PwBD",   pwbd_candidates)]:
+    message = Mail(
+        from_email=EMAIL_ADDRESS,
+        to_emails=to_email,
+        subject=f"Matched Candidates for {company_name}",
+        html_content=body,
+    )
+    for label, candidates in [("Fresher", fresher_candidates), ("PwBD", pwbd_candidates)]:
         for i, c in enumerate(candidates, 1):
             resume_id = c.get("resumeFileId")
             if not resume_id:
@@ -349,23 +377,23 @@ def send_email_with_resumes(to_email: str, company_name: str,
             try:
                 resume_file = get_resume_from_gridfs(resume_id)
                 if resume_file:
-                    name     = c.get("name") or c.get("fullName", f"{label}_{i}")
-                    part     = MIMEBase("application", "pdf")
-                    part.set_payload(resume_file.read())
-                    encoders.encode_base64(part)
+                    name      = c.get("name") or c.get("fullName", f"{label}_{i}")
                     safe_name = secure_filename(name)
-                    part.add_header("Content-Disposition",
-                                    f'attachment; filename="{safe_name}_{label}_Resume.pdf"')
-                    msg.attach(part)
+                    file_data = base64.b64encode(resume_file.read()).decode()
+                    attachment = Attachment(
+                        FileContent(file_data),
+                        FileName(f"{safe_name}_{label}_Resume.pdf"),
+                        FileType("application/pdf"),
+                        Disposition("attachment"),
+                    )
+                    message.add_attachment(attachment)
                     print(f"✅ Attached resume for {name}")
             except Exception as e:
                 print(f"⚠️  Could not attach resume for {label} {i}: {e}")
-
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.send_message(msg)
-        print(f"✅ Email sent to {to_email} — "
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"✅ Email sent to {to_email} (status {response.status_code}) — "
               f"{len(fresher_candidates)} freshers, {len(pwbd_candidates)} PwBDs")
         return True
     except Exception as e:
@@ -376,10 +404,6 @@ def send_email_with_resumes(to_email: str, company_name: str,
 
 def send_no_candidates_email(to_email: str, company_name: str) -> bool:
     try:
-        msg = MIMEMultipart()
-        msg["Subject"] = f"No Additional Candidates Available — {company_name}"
-        msg["From"]    = EMAIL_ADDRESS
-        msg["To"]      = to_email
         body = f"""
         <html><body>
             <h2>Hello {company_name},</h2>
@@ -391,10 +415,15 @@ def send_no_candidates_email(to_email: str, company_name: str) -> bool:
             <p>Best regards,<br>The Mumbai121 Team</p>
         </body></html>
         """
-        msg.attach(MIMEText(body, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.send_message(msg)
+        message = Mail(
+            from_email=EMAIL_ADDRESS,
+            to_emails=to_email,
+            subject=f"No Additional Candidates Available — {company_name}",
+            html_content=body,
+        )
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        print(f"✅ No-candidates email sent (status {response.status_code})")
         return True
     except Exception as e:
         print(f"❌ No-candidates email error: {e}")
@@ -731,7 +760,7 @@ def get_companies():
                 {"company": 1, "jobPreference": 1, "employees": 1, "_id": 0}
             ).limit(12)
         )
-        return companies
+        return JSONResponse(content=companies, headers={"Cache-Control": "no-store"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -740,11 +769,12 @@ def get_companies():
 def get_stats():
     """Public stats endpoint for homepage counters."""
     try:
-        return {
+        data = {
             "freshers":  db.Freshers.count_documents({}),
             "pwbd":      db.PwBDs.count_documents({}),
             "companies": db.Requirements.count_documents({}),
         }
+        return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
